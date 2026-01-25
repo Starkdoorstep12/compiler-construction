@@ -61,12 +61,23 @@
   (lambda (e)
     (match e
       [(Var x)
-       (error "TODO: code goes here (uniquify-exp Var)")]
-      [(Int n) (Int n)]
+       (Var (dict-ref env x))]
+
+      [(Int n)
+       (Int n)]
+
       [(Let x e body)
-       (error "TODO: code goes here (uniquify-exp Let)")]
+       (let* ([x1 (gensym x)]
+              [e1 ((uniquify-exp env) e)]
+              [env1 (dict-set env x x1)]
+              [body1 ((uniquify-exp env1) body)])
+         (Let x1 e1 body1))]
+
       [(Prim op es)
-       (Prim op (for/list ([e es]) ((uniquify-exp env) e)))])))
+       (Prim op
+             (for/list ([e es])
+               ((uniquify-exp env) e)))])))
+
 
 ;; uniquify : Lvar -> Lvar
 (define (uniquify p)
@@ -103,7 +114,7 @@
 (define compiler-passes
   `(
      ;; Uncomment the following passes as you finish them.
-     ;; ("uniquify" ,uniquify ,interp_Lvar ,type-check-Lvar)
+      ("uniquify" ,uniquify ,interp_Lvar ,type-check-Lvar)
      ;; ("remove complex opera*" ,remove-complex-opera* ,interp_Lvar ,type-check-Lvar)
      ;; ("explicate control" ,explicate-control ,interp-Cvar ,type-check-Cvar)
      ;; ("instruction selection" ,select-instructions ,interp-pseudo-x86-0)
