@@ -84,9 +84,49 @@
   (match p
     [(Program info e) (Program info ((uniquify-exp '()) e))]))
 
+(define (atomic? e)
+  (match e
+    [(Int _) #t]
+    [(Var _) #t]
+    [else #f]))
+
+(define (rco-atom e)
+  (define e1 (rco-exp e))
+  (if (atomic? e1)
+      (values e1 '())
+      (let ([t (gensym 'tmp)])
+        (values (Var t)
+                (list (cons t e1))))))
+
+
+(define (rco-args es)
+  (match es
+    ['() (values '() '())]
+    [(cons e rest)
+     (define-values (a1 b1) (rco-atom e))
+     (define-values (a2 b2) (rco-args rest))
+     (values (cons a1 a2)
+             (append b1 b2))]))
+
+(define (rco-exp e)
+  (match e
+    [(Int n) (Int n)]
+    [(Var x) (Var x)]
+
+    [(Let x rhs body)
+     (Let x (rco-exp rhs) (rco-exp body))]
+
+    [(Prim op es)
+     (define-values (atoms binds) (rco-args es))
+     (make-lets binds (Prim op atoms))]))
+
+
 ;; remove-complex-opera* : Lvar -> Lvar^mon
 (define (remove-complex-opera* p)
-  (error "TODO: code goes here (remove-complex-opera*)"))
+  (match p
+    [(Program info e)
+     (Program info (rco-exp e))]))
+
 
 ;; explicate-control : Lvar^mon -> Cvar
 (define (explicate-control p)
@@ -115,7 +155,7 @@
   `(
      ;; Uncomment the following passes as you finish them.
       ("uniquify" ,uniquify ,interp_Lvar ,type-check-Lvar)
-     ;; ("remove complex opera*" ,remove-complex-opera* ,interp_Lvar ,type-check-Lvar)
+      ("remove complex opera*" ,remove-complex-opera* ,interp_Lvar ,type-check-Lvar)
      ;; ("explicate control" ,explicate-control ,interp-Cvar ,type-check-Cvar)
      ;; ("instruction selection" ,select-instructions ,interp-pseudo-x86-0)
      ;; ("assign homes" ,assign-homes ,interp-x86-0)
