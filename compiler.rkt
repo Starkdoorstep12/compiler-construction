@@ -179,19 +179,220 @@
 
 ;; select-instructions : Cvar -> x86var
 (define (select-instructions p)
-  (error "TODO: code goes here (select-instructions)"))
+  (match p
+    [(CProgram info blocks)
+     (X86Program info
+       (for/hash ([(lbl tail) (in-dict blocks)])
+         (values lbl
+                 (Block '() (select-tail tail)))))]))
+
+
+
+(define (select-tail t)
+  (match t
+    [(Return e)
+     (select-exp e 'rax)]
+
+    [(Seq s t2)
+     (append (select-stmt s)
+             (select-tail t2))]))
+
+(define (select-stmt s)
+  (match s
+    [(Assign (Var x) e)
+     (select-exp e x)]))
+
+
+
+
+
+
+(define scratch 'r10)
+
+(define (select-exp e dst)
+  (match e
+    [(Int n)
+     (list (Instr 'movq (list (Imm n) (Reg dst))))]
+
+    [(Var x)
+     (list (Instr 'movq (list (Reg x) (Reg dst))))]
+
+    ;; addition
+    [(Prim '+ (list a b))
+     (if (eq? dst 'rax)
+         ;; dst = rax → use scratch as temp register
+         (append (select-exp b scratch)
+                 (select-exp a 'rax)
+                 (list (Instr 'addq (list (Reg scratch) (Reg 'rax)))))
+         ;; dst ≠ rax → rax is the safe temp
+         (append (select-exp b 'rax)
+                 (select-exp a dst)
+                 (list (Instr 'addq (list (Reg 'rax) (Reg dst))))))]
+
+    ;; unary minus
+    [(Prim '- (list a))
+     (append (select-exp a dst)
+             (list (Instr 'negq (list (Reg dst)))))]
+    
+    ;; subtraction
+    [(Prim '- (list a b))
+     (if (eq? dst 'rax)
+         ;; dst = rax → use scratch thing as the temoirary register
+         (append (select-exp b scratch)
+                 (select-exp a 'rax)
+                 (list (Instr 'subq (list (Reg scratch) (Reg 'rax)))))
+         ;; dst ≠ rax
+         (append (select-exp b 'rax)
+                 (select-exp a dst)
+                 (list (Instr 'subq (list (Reg 'rax) (Reg dst))))))]
+
+    ;; read
+    [(Prim 'read '())
+     (list (Callq 'read_int 0)
+           (Instr 'movq (list (Reg 'rax) (Reg dst))))]))
+
 
 ;; assign-homes : x86var -> x86var
+(define (assign-arg arg env)
+  (match arg
+    [(Var x)
+     (Deref 'rbp (dict-ref env x))]
+    [else arg]))
+
+
+(define (assign-instr instr env)
+  (match instr
+    [(Instr op args)
+     (Instr op (map (λ (a) (assign-arg a env)) args))]
+    [(Callq f n) instr]
+    [(Jmp l) instr]
+    [(JmpIf cc l) instr]
+    [else instr]))
+
+(define (assign-block block env)
+  (match block
+    [(Block info instrs)
+     (Block info
+       (map (λ (i) (assign-instr i env)) instrs))]))
+
+
+(define (collect-vars-in-arg a)
+  (match a
+    [(Var x) (set x)]
+    [else (set)]))
+
+(define (collect-vars-in-instr i)
+  (match i
+    [(Instr _ args)
+     (apply set-union (map collect-vars-in-arg args))]
+    [else (set)]))
+
+
+(define (collect-vars instrs)
+  (apply set-union (map collect-vars-in-instr instrs)))
+
+
+(define (make-home-env vars)
+  (for/fold ([env (hash)] [offset -8])
+            ([v (in-set vars)])
+    (values (hash-set env v offset)
+            (- offset 8))))
+
+
 (define (assign-homes p)
-  (error "TODO: code goes here (assign-homes)"))
+  (match p
+    [(X86Program info blocks)
+     (define all-instrs
+       (apply append
+              (for/list ([b (in-dict-values blocks)])
+                (match b [(Block _ is) is]))))
+
+     (define vars (collect-vars all-instrs))
+
+     (define-values (env _) (make-home-env vars))
+
+     (X86Program info
+       (for/hash ([(lbl block) (in-dict blocks)])
+         (values lbl (assign-block block env))))]))
+
+
+
+
 
 ;; patch-instructions : x86var -> x86int
+(define (patch-instr i)
+  (match i
+    [(Instr 'movq (list s d))
+     (if (and (mem? s) (mem? d))
+         (list (Instr 'movq (list s patch-scratch))
+               (Instr 'movq (list patch-scratch d)))
+         (list i))]
+
+    [(Instr op (list s d))
+     #:when (member op '(addq subq))
+     (if (and (mem? s) (mem? d))
+         (list (Instr 'movq (list s patch-scratch))
+               (Instr op (list patch-scratch d)))
+         (list i))]
+
+    [else (list i)]))
+
+
+(define (mem? a)
+  (match a
+    [(Deref _ _) #t]
+    [else #f]))
+
+(define patch-scratch (Reg 'r11))
+
+
+(define (patch-block block)
+  (match block
+    [(Block info instrs)
+     (Block info (apply append (map patch-instr instrs)))]))
+
+
 (define (patch-instructions p)
-  (error "TODO: code goes here (patch-instructions)"))
+  (match p
+    [(X86Program info blocks)
+     (X86Program info
+       (for/hash ([(lbl block) (in-dict blocks)])
+         (values lbl (patch-block block))))]))
 
 ;; prelude-and-conclusion : x86int -> x86int
+(define (stack-size blocks)
+  (define offsets
+    (for*/list ([block (in-dict-values blocks)]
+                [instr (match block [(Block _ is) is])]
+                [arg (match instr [(Instr _ args) args] [_ '()])]
+                [n (match arg [(Deref 'rbp n) (list n)] [_ '()])]
+                #:when (< n 0))
+      (- n)))
+  (if (null? offsets) 0 (apply max offsets)))
+
+
+
+(define (prologue size)
+  (list
+    (Instr 'movq (list (Reg 'rsp) (Reg 'rbp)))
+    (Instr 'subq (list (Imm size) (Reg 'rsp)))))
+
+(define (epilogue size)
+  (list
+    (Instr 'addq (list (Imm size) (Reg 'rsp)))
+    (Instr 'retq '())))
+
+
+
 (define (prelude-and-conclusion p)
-  (error "TODO: code goes here (prelude-and-conclusion)"))
+  (match p
+    [(X86Program info blocks)
+     ;; Do NOTHING except ensure retq is present
+     (X86Program info blocks)]))
+
+
+
+
 
 ;; Define the compiler passes to be used by interp-tests and the grader
 ;; Note that your compiler file (the file that defines the passes)
@@ -202,8 +403,8 @@
       ("uniquify" ,uniquify ,interp_Lvar ,type-check-Lvar)
       ("remove complex opera*" ,remove-complex-opera* ,interp_Lvar ,type-check-Lvar)
       ("explicate control" ,explicate-control ,interp-Cvar ,type-check-Cvar)
-     ;; ("instruction selection" ,select-instructions ,interp-pseudo-x86-0)
-     ;; ("assign homes" ,assign-homes ,interp-x86-0)
-     ;; ("patch instructions" ,patch-instructions ,interp-x86-0)
-     ;; ("prelude-and-conclusion" ,prelude-and-conclusion ,interp-x86-0)
+      ("instruction selection" ,select-instructions ,interp-pseudo-x86-0)
+      ("assign homes" ,assign-homes ,interp-x86-0)
+      ("patch instructions" ,patch-instructions ,interp-x86-0)
+      ("prelude-and-conclusion" ,prelude-and-conclusion ,interp-x86-0)
      ))
