@@ -9,6 +9,11 @@
 (require "type-check-Cvar.rkt")
 (require "utilities.rkt")
 (provide (all-defined-out))
+(require graph)
+(define physical-registers
+  (set 'rax 'rbx 'rcx 'rdx 'rsi 'rdi 'r8 'r9 'r10 'r11 'rsp 'rbp))
+(define (is-var? x)
+  (not (set-member? physical-registers x)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Lint examples
@@ -187,6 +192,209 @@
                  (Block '() (select-tail tail)))))]))
 
 
+; we are doing 3.2 which is uncover_live
+(define (locations-in-arg a)
+  (match a
+    [(Reg x) (set x)]
+    [(Deref r _) (set r)]
+    [_ (set)]))
+
+
+(define (reads-of-instr i)
+  (match i
+    [(Instr 'movq (list s d))
+     (locations-in-arg s)]
+
+    [(Instr 'addq (list s d))
+     (set-union (locations-in-arg s)
+                (locations-in-arg d))]
+
+    [(Instr 'subq (list s d))
+     (set-union (locations-in-arg s)
+                (locations-in-arg d))]
+
+    [(Instr 'negq (list d))
+     (locations-in-arg d)]
+
+    [(Callq _ _)
+     ;; argument registers
+     (set 'rdi 'rsi 'rdx 'rcx 'r8 'r9)]
+
+    [_ (set)]))
+(define (writes-of-instr i)
+  (match i
+    [(Instr 'movq (list s d))
+     (locations-in-arg d)]
+
+    [(Instr 'addq (list s d))
+     (locations-in-arg d)]
+
+    [(Instr 'subq (list s d))
+     (locations-in-arg d)]
+
+    [(Instr 'negq (list d))
+     (locations-in-arg d)]
+
+    [(Callq _ _)
+     ;; caller-saved registers
+     (set 'rax 'rcx 'rdx 'rsi 'rdi 'r8 'r9 'r10 'r11)]
+
+    [_ (set)]))
+
+(define (compute-live instrs)
+  (define (loop rev-instrs live-after acc)
+    (match rev-instrs
+      ['() acc]
+      [(cons i rest)
+       (define R (reads-of-instr i))
+       (define W (writes-of-instr i))
+       (define live-before
+         (set-union R
+                    (set-subtract live-after W)))
+       (loop rest
+             live-before
+             (cons live-after acc))]))
+  (loop (reverse instrs) (set) '()))
+
+
+(define (uncover_live p)
+  (match p
+    [(X86Program info blocks)
+     (X86Program info
+       (for/hash ([(lbl block) (in-dict blocks)])
+         (match block
+           [(Block _ instrs)
+            (define lives (compute-live instrs))
+            (values lbl
+                    (Block `(lives ,lives) instrs))])))]))
+
+
+
+(define (build_interference p)
+  (match p
+    [(X86Program info blocks)
+     (define g (undirected-graph '()))
+
+     ;; First add all vertices
+(for ([(lbl block) (in-dict blocks)])
+  (match block
+    [(Block `(lives ,live-list) instrs)
+     (for ([live live-list])
+       (for ([v (in-set live)])
+         (when (is-var? v)
+           (add-vertex! g v))))]))
+
+
+     ;; Now add edges
+     (for ([(lbl block) (in-dict blocks)])
+       (match block
+         [(Block `(lives ,live-list) instrs)
+          (for ([i instrs]
+                [live-after live-list])
+            (define W (writes-of-instr i))
+            (define R (reads-of-instr i))
+
+            (for ([w (in-set W)])
+              (when (is-var? w)
+                (define neighbors
+                  (match i
+                    [(Instr 'movq (list s d))
+                     (set-subtract live-after (locations-in-arg s))]
+                    [_ live-after]))
+
+                (for ([v (in-set neighbors)])
+                  (when (and (is-var? v)
+                             (not (equal? v w)))
+                    (add-edge! g w v))))))]))
+
+     ;; Store graph in info field
+     (X86Program (dict-set info 'conflicts g)
+                 blocks)]))
+
+(define allocatable-registers
+  '(rbx rcx rdx rsi rdi r8 r9 r10 r11))
+
+(define (color-graph g)
+  (define color-env (make-hash))
+  (define spills '())
+
+  (for ([v (in-vertices g)])
+    (define neighbor-regs
+      (for/set ([n (in-neighbors g v)]
+                #:when (hash-has-key? color-env n))
+        (hash-ref color-env n)))
+
+    (define chosen
+      (for/first ([r allocatable-registers]
+                  #:unless (set-member? neighbor-regs r))
+        r))
+
+    (if chosen
+        (hash-set! color-env v chosen)
+        (set! spills (cons v spills))))
+
+  (values color-env spills))
+
+
+(define (assign-spills spills)
+  (for/fold ([env (hash)] [offset -8])
+            ([v spills])
+    (values (hash-set env v offset)
+            (- offset 8))))
+
+(define (replace-arg a reg-env spill-env)
+  (match a
+    [(Reg x)
+     (cond
+       [(hash-has-key? reg-env x)
+        (Reg (hash-ref reg-env x))]
+       [(hash-has-key? spill-env x)
+        (Deref 'rbp (hash-ref spill-env x))]
+       [else a])]
+    [_ a]))
+
+
+(define (replace-instr i reg-env spill-env)
+  (match i
+    [(Instr op args)
+     (Instr op
+            (map (λ (a)
+                   (replace-arg a reg-env spill-env))
+                 args))]
+    [_ i]))
+
+
+
+(define (allocate_registers p)
+  (match p
+    [(X86Program info blocks)
+
+     (define g (dict-ref info 'conflicts))
+
+     (define-values (reg-env spills)
+       (color-graph g))
+
+     (define-values (spill-env _)
+       (assign-spills spills))
+
+     (define new-blocks
+       (for/hash ([(lbl block) (in-dict blocks)])
+         (match block
+           [(Block info2 instrs)
+            (values lbl
+                    (Block info2
+                           (map (λ (i)
+                                  (replace-instr i reg-env spill-env))
+                                instrs)))])))
+
+     (X86Program
+      (dict-set info 'num-spills (length spills))
+      new-blocks)]))
+
+
+
+
+;;end
 
 (define (select-tail t)
   (match t
@@ -323,6 +531,11 @@
 (define (patch-instr i)
   (match i
     [(Instr 'movq (list s d))
+ #:when (equal? s d)
+ '()]
+
+
+    [(Instr 'movq (list s d))
      (if (and (mem? s) (mem? d))
          (list (Instr 'movq (list s patch-scratch))
                (Instr 'movq (list patch-scratch d)))
@@ -372,24 +585,68 @@
 
 
 
+;(define (prologue size)
+;  (list
+;    (Instr 'movq (list (Reg 'rsp) (Reg 'rbp)))
+;    (Instr 'subq (list (Imm size) (Reg 'rsp)))))
+;
+;(define (epilogue size)
+;  (list
+;    (Instr 'addq (list (Imm size) (Reg 'rsp)))
+;    (Instr 'retq '())))
+
 (define (prologue size)
-  (list
-    (Instr 'movq (list (Reg 'rsp) (Reg 'rbp)))
-    (Instr 'subq (list (Imm size) (Reg 'rsp)))))
+  (append
+    (list
+      (Instr 'pushq (list (Reg 'rbp)))
+      (Instr 'movq (list (Reg 'rsp) (Reg 'rbp))))
+    (if (> size 0)
+        (list (Instr 'subq (list (Imm size) (Reg 'rsp))))
+        '())))
 
 (define (epilogue size)
-  (list
-    (Instr 'addq (list (Imm size) (Reg 'rsp)))
-    (Instr 'retq '())))
+  (append
+    (if (> size 0)
+        (list (Instr 'addq (list (Imm size) (Reg 'rsp))))
+        '())
+    (list
+      (Instr 'popq (list (Reg 'rbp)))
+      (Retq))))
 
 
+
+;(define (prelude-and-conclusion p)
+;  (match p
+;    [(X86Program info blocks)
+;     ;; Do NOTHING except ensure retq is present
+;     (X86Program info blocks)]))
 
 (define (prelude-and-conclusion p)
   (match p
     [(X86Program info blocks)
-     ;; Do NOTHING except ensure retq is present
-     (X86Program info blocks)]))
+     (define size (stack-size blocks))
 
+     (define new-blocks
+       (for/hash ([(lbl block) (in-dict blocks)])
+         (match block
+           [(Block info instrs)
+            (values 'main
+              (Block info
+                (append
+                  (prologue size)
+                  (remove-ret instrs)
+                  (epilogue size))))])))
+
+     (X86Program info new-blocks)]))
+
+
+(define (remove-ret instrs)
+  (filter
+    (λ (i)
+      (not (match i
+             [(Retq) #t]
+             [_ #f])))
+    instrs))
 
 
 
@@ -404,7 +661,13 @@
       ("remove complex opera*" ,remove-complex-opera* ,interp_Lvar ,type-check-Lvar)
       ("explicate control" ,explicate-control ,interp-Cvar ,type-check-Cvar)
       ("instruction selection" ,select-instructions ,interp-pseudo-x86-0)
-      ("assign homes" ,assign-homes ,interp-x86-0)
+;      ("assign homes" ,assign-homes ,interp-x86-0)
+;      ("patch instructions" ,patch-instructions ,interp-x86-0)
+;      ("prelude-and-conclusion" ,prelude-and-conclusion ,interp-x86-0)
+      ("uncover live" ,uncover_live ,interp-x86-0)
+      ("build interference" ,build_interference ,interp-x86-0)
+      ("allocate registers" ,allocate_registers ,interp-x86-0)
       ("patch instructions" ,patch-instructions ,interp-x86-0)
       ("prelude-and-conclusion" ,prelude-and-conclusion ,interp-x86-0)
+
      ))
