@@ -1,12 +1,17 @@
 #lang racket
+(displayln "COMPILER.RKT LOADED")
 (require racket/set racket/stream)
 (require racket/fixnum)
-(require "interp-Lint.rkt")
-(require "interp-Lvar.rkt")
+;(require "interp-Lint.rkt")
+;(require "interp-Lvar.rkt")
 (require "interp-Cvar.rkt")
 (require "interp.rkt")
-(require "type-check-Lvar.rkt")
 (require "type-check-Cvar.rkt")
+;(require "type-check-Lvar.rkt")
+(require "interp-Cif.rkt")
+(require "type-check-Cif.rkt")
+(require "interp-Lif.rkt")
+(require "type-check-Lif.rkt")
 (require "utilities.rkt")
 (provide (all-defined-out))
 (require graph)
@@ -33,7 +38,43 @@
   (match e
     [(Program info e) (Program info (flip-exp e))]))
 
+(define (shrink-exp e)
+  (match e
+    [(Int _) e]
+    [(Bool _) e]
+    [(Var _) e]
 
+    [(Let x rhs body)
+     (Let x (shrink-exp rhs)
+              (shrink-exp body))]
+
+    [(If c t f)
+     (If (shrink-exp c)
+         (shrink-exp t)
+         (shrink-exp f))]
+
+    ;; AND
+    [(Prim 'and (list e1 e2))
+     (If (shrink-exp e1)
+         (If (shrink-exp e2)
+             (Bool #t)
+             (Bool #f))
+         (Bool #f))]
+
+    ;; OR
+    [(Prim 'or (list e1 e2))
+     (If (shrink-exp e1)
+         (Bool #t)
+         (If (shrink-exp e2)
+             (Bool #t)
+             (Bool #f)))]
+
+    [(Prim op es)
+     (Prim op (map shrink-exp es))]))
+(define (shrink p)
+  (match p
+    [(Program info e)
+     (Program info (shrink-exp e))]))
 ;; Next we have the partial evaluation pass described in the book.
 (define (pe-neg r)
   (match r
@@ -71,6 +112,16 @@
       [(Int n)
        (Int n)]
 
+      ;;
+      [(Bool b)
+       (Bool b)]
+
+      ;;
+      [(If c t f)
+       (If ((uniquify-exp env) c)
+           ((uniquify-exp env) t)
+           ((uniquify-exp env) f))]
+
       [(Let x e body)
        (let* ([x1 (gensym x)]
               [e1 ((uniquify-exp env) e)]
@@ -82,7 +133,6 @@
        (Prim op
              (for/list ([e es])
                ((uniquify-exp env) e)))])))
-
 
 ;; uniquify : Lvar -> Lvar
 (define (uniquify p)
@@ -150,6 +200,9 @@
     [(Int n)
      (Return (Int n))]
 
+    [(Bool b)
+     (Return (Bool b))]
+
     [(Var x)
      (Return (Var x))]
 
@@ -158,6 +211,11 @@
 
     [(Prim op es)
      (Return (Prim op es))]
+
+    [(If c t f)
+     (explicate-pred c
+                     (explicate-tail t)
+                     (explicate-tail f))]
 
     [(Let x rhs body)
      (explicate-assign x rhs (explicate-tail body))]))
@@ -168,6 +226,9 @@
     [(Int n)
      (Seq (Assign (Var x) (Int n)) k)]
 
+    [(Bool b)
+     (Seq (Assign (Var x) (Bool b)) k)]
+
     [(Var y)
      (Seq (Assign (Var x) (Var y)) k)]
 
@@ -177,10 +238,34 @@
     [(Prim op es)
      (Seq (Assign (Var x) (Prim op es)) k)]
 
+    [(If c t f)
+     (explicate-pred c
+                     (explicate-assign x t k)
+                     (explicate-assign x f k))]
+
     [(Let y r b)
      (explicate-assign y r
        (explicate-assign x b k))]))
 
+(define (explicate-pred c thn els)
+  (match c
+    [(Bool #t)
+     thn]
+
+    [(Bool #f)
+     els]
+
+    [(If c1 t1 f1)
+     (explicate-pred c1
+                     (explicate-pred t1 thn els)
+                     (explicate-pred f1 thn els))]
+
+    [(Let x rhs body)
+     (explicate-assign x rhs
+       (explicate-pred body thn els))]
+
+    [_
+     (IfStmt c thn els)]))
 
 ;; select-instructions : Cvar -> x86var
 (define (select-instructions p)
@@ -403,8 +488,33 @@
 
     [(Seq s t2)
      (append (select-stmt s)
-             (select-tail t2))]))
+             (select-tail t2))]
 
+    [(IfStmt c thn els)
+     (select-pred c thn els)]))
+
+(define (select-pred c thn els)
+  (match c
+    [(Bool #t)
+     (list (Jmp thn))]
+
+    [(Bool #f)
+     (list (Jmp els))]
+
+    [(Prim 'eq? (list a b))
+     (append (select-exp a 'rax)
+             (select-exp b 'rbx)
+             (list
+              (Instr 'cmpq (list (Reg 'rbx) (Reg 'rax)))
+              (JmpIf 'e thn)
+              (Jmp els)))]
+
+    [_
+     (append (select-exp c 'rax)
+             (list
+              (Instr 'cmpq (list (Imm 0) (Reg 'rax)))
+              (JmpIf 'ne thn)
+              (Jmp els)))]))
 (define (select-stmt s)
   (match s
     [(Assign (Var x) e)
@@ -657,17 +767,20 @@
 (define compiler-passes
   `(
      ;; Uncomment the following passes as you finish them.
-      ("uniquify" ,uniquify ,interp_Lvar ,type-check-Lvar)
-      ("remove complex opera*" ,remove-complex-opera* ,interp_Lvar ,type-check-Lvar)
-      ("explicate control" ,explicate-control ,interp-Cvar ,type-check-Cvar)
-      ("instruction selection" ,select-instructions ,interp-pseudo-x86-0)
-;      ("assign homes" ,assign-homes ,interp-x86-0)
+;      ("uniquify" ,uniquify ,interp_Lvar ,type-check-Lvar)
+;      ("remove complex opera*" ,remove-complex-opera* ,interp_Lvar ,type-check-Lvar)
+;      ("explicate control" ,explicate-control ,interp-Cvar ,type-check-Cvar)
+;      ("instruction selection" ,select-instructions ,interp-pseudo-x86-0)
+;;      ("assign homes" ,assign-homes ,interp-x86-0)
+;;      ("patch instructions" ,patch-instructions ,interp-x86-0)
+;;      ("prelude-and-conclusion" ,prelude-and-conclusion ,interp-x86-0)
+;      ("uncover live" ,uncover_live ,interp-x86-0)
+;      ("build interference" ,build_interference ,interp-x86-0)
+;      ("allocate registers" ,allocate_registers ,interp-x86-0)
 ;      ("patch instructions" ,patch-instructions ,interp-x86-0)
 ;      ("prelude-and-conclusion" ,prelude-and-conclusion ,interp-x86-0)
-      ("uncover live" ,uncover_live ,interp-x86-0)
-      ("build interference" ,build_interference ,interp-x86-0)
-      ("allocate registers" ,allocate_registers ,interp-x86-0)
-      ("patch instructions" ,patch-instructions ,interp-x86-0)
-      ("prelude-and-conclusion" ,prelude-and-conclusion ,interp-x86-0)
-
+    ("shrink" ,shrink ,interp-Lif ,type-check-Lif)
+    ("uniquify" ,uniquify ,interp-Lif ,type-check-Lif)
+    ("explicate_control" ,explicate-control ,interp-Cif ,type-check-Cif)
+    ("select_instructions" ,select-instructions ,interp-pseudo-x86-1)
      ))
