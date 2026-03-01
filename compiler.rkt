@@ -1,5 +1,4 @@
 #lang racket
-(displayln "COMPILER.RKT LOADED")
 (require racket/set racket/stream)
 (require racket/fixnum)
 ;(require "interp-Lint.rkt")
