@@ -739,12 +739,16 @@
        (for/hash ([(lbl block) (in-dict blocks)])
          (match block
            [(Block info instrs)
-            (values 'main
-              (Block info
-                (append
-                  (prologue size)
-                  (remove-ret instrs)
-                  (epilogue size))))])))
+            (cond
+              [(eq? lbl 'start)
+               (values 'main
+                 (Block info
+                   (append
+                     (prologue size)
+                     (remove-ret instrs)
+                     (epilogue size))))]
+              [else
+               (values lbl block)])])))
 
      (X86Program info new-blocks)]))
 
@@ -782,4 +786,9 @@
     ("uniquify" ,uniquify ,interp-Lif ,type-check-Lif)
     ("explicate_control" ,explicate-control ,interp-Cif ,type-check-Cif)
     ("select_instructions" ,select-instructions ,interp-pseudo-x86-1)
+    ("uncover_live" ,uncover_live ,interp-pseudo-x86-1)
+    ("build_interference" ,build_interference ,interp-pseudo-x86-1)
+    ("allocate_registers" ,allocate_registers ,interp-pseudo-x86-1)
+    ("patch_instructions" ,patch-instructions ,interp-x86-1)
+    ("prelude-and-conclusion" ,prelude-and-conclusion ,interp-x86-1)
      ))

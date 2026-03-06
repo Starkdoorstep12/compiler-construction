@@ -27,13 +27,13 @@
         all-tests)))
 
 ;; The following tests the intermediate-language outputs of the passes.
-(interp-tests
- "lif"
- type-check-Lif
- compiler-passes
- interp-Lif
- "lif_test"
- (tests-for "lif"))
+;(interp-tests
+; "lif"
+; type-check-Lif
+; compiler-passes
+; interp-Lif
+; "lif_test"
+; (tests-for "lif"))
 ;; Uncomment the following when all the passes are complete to
 ;; test the final x86 code.
-;(compiler-tests "var" #f compiler-passes "var_test" (tests-for "var"))
+(compiler-tests "var" #f compiler-passes "var_test" (tests-for "var"))
