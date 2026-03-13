@@ -11,6 +11,11 @@
 (require "type-check-Cif.rkt")
 (require "interp-Lif.rkt")
 (require "type-check-Lif.rkt")
+(require "interp-Lwhile.rkt")
+(require "type-check-Lwhile.rkt")
+
+(require "interp-Cwhile.rkt")
+(require "type-check-Cwhile.rkt")
 (require "utilities.rkt")
 (provide (all-defined-out))
 (require graph)
@@ -45,12 +50,16 @@
 
     [(Let x rhs body)
      (Let x (shrink-exp rhs)
-              (shrink-exp body))]
+          (shrink-exp body))]
 
     [(If c t f)
      (If (shrink-exp c)
          (shrink-exp t)
          (shrink-exp f))]
+
+    [(WhileLoop c body)
+     (WhileLoop (shrink-exp c)
+                (shrink-exp body))]
 
     ;; AND
     [(Prim 'and (list e1 e2))
@@ -120,6 +129,9 @@
        (If ((uniquify-exp env) c)
            ((uniquify-exp env) t)
            ((uniquify-exp env) f))]
+      [(WhileLoop c body)
+ (WhileLoop ((uniquify-exp env) c)
+            ((uniquify-exp env) body))]
 
       [(Let x e body)
        (let* ([x1 (gensym x)]
@@ -170,10 +182,13 @@
     [(Let x rhs body)
      (Let x (rco-exp rhs) (rco-exp body))]
 
+    [(WhileLoop c body)
+     (WhileLoop (rco-exp c)
+                (rco-exp body))]
+
     [(Prim op es)
      (define-values (atoms binds) (rco-args es))
      (make-lets binds (Prim op atoms))]))
-
 
 ;; remove-complex-opera* : Lvar -> Lvar^mon
 (define (remove-complex-opera* p)
@@ -215,6 +230,13 @@
      (explicate-pred c
                      (explicate-tail t)
                      (explicate-tail f))]
+
+    [(WhileLoop c body)
+     (explicate-pred
+      c
+      (Seq (explicate-tail body)
+           (explicate-tail (WhileLoop c body)))
+      (Return (Int 0)))]
 
     [(Let x rhs body)
      (explicate-assign x rhs (explicate-tail body))]))
@@ -741,7 +763,7 @@
            [(Block info instrs)
             (cond
               [(eq? lbl 'start)
-               (values 'main
+               (values 'start
                  (Block info
                    (append
                      (prologue size)
@@ -782,13 +804,16 @@
 ;      ("allocate registers" ,allocate_registers ,interp-x86-0)
 ;      ("patch instructions" ,patch-instructions ,interp-x86-0)
 ;      ("prelude-and-conclusion" ,prelude-and-conclusion ,interp-x86-0)
-    ("shrink" ,shrink ,interp-Lif ,type-check-Lif)
-    ("uniquify" ,uniquify ,interp-Lif ,type-check-Lif)
-    ("explicate_control" ,explicate-control ,interp-Cif ,type-check-Cif)
+    ;("shrink" ,shrink ,interp-Lif ,type-check-Lif)
+    ("shrink" ,shrink ,interp-Lwhile ,type-check-Lwhile)
+    ;("uniquify" ,uniquify ,interp-Lif ,type-check-Lif)
+    ("uniquify" ,uniquify ,interp-Lwhile ,type-check-Lwhile)
+    ;("explicate_control" ,explicate-control ,interp-Cif ,type-check-Cif)
+    ("explicate_control" ,explicate-control ,interp-Cwhile ,type-check-Cwhile)
     ("select_instructions" ,select-instructions ,interp-pseudo-x86-1)
     ("uncover_live" ,uncover_live ,interp-pseudo-x86-1)
     ("build_interference" ,build_interference ,interp-pseudo-x86-1)
     ("allocate_registers" ,allocate_registers ,interp-pseudo-x86-1)
     ("patch_instructions" ,patch-instructions ,interp-x86-1)
-    ("prelude-and-conclusion" ,prelude-and-conclusion ,interp-x86-1)
+    ;("prelude-and-conclusion" ,prelude-and-conclusion ,interp-x86-1)
      ))
