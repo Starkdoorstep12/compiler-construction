@@ -1,5 +1,6 @@
 #lang racket
 (require racket/set racket/stream)
+(require racket/list)
 (require racket/fixnum)
 ;(require "interp-Lint.rkt")
 ;(require "interp-Lvar.rkt")
@@ -20,7 +21,7 @@
 (provide (all-defined-out))
 (require graph)
 (define physical-registers
-  (set 'rax 'rbx 'rcx 'rdx 'rsi 'rdi 'r8 'r9 'r10 'r11 'rsp 'rbp))
+  (set 'rax 'rbx 'rcx 'rdx 'rsi 'rdi 'r8 'r9 'r10 'r11))
 (define (is-var? x)
   (not (set-member? physical-registers x)))
 
@@ -61,7 +62,10 @@
      (WhileLoop (shrink-exp c)
                 (shrink-exp body))]
 
-    ;; AND
+    [(SetBang x e1)
+     (SetBang x (shrink-exp e1))]
+
+    ;; AND → desugar
     [(Prim 'and (list e1 e2))
      (If (shrink-exp e1)
          (If (shrink-exp e2)
@@ -69,13 +73,30 @@
              (Bool #f))
          (Bool #f))]
 
-    ;; OR
+    ;; OR → desugar
     [(Prim 'or (list e1 e2))
      (If (shrink-exp e1)
          (Bool #t)
          (If (shrink-exp e2)
              (Bool #t)
              (Bool #f)))]
+
+    ;; FIX: handle malformed let coming as Apply
+    [(Apply (Var 'let) (cons binding body-exprs))
+ (match binding
+   ;; FIX: handle nested Apply
+   [(Apply (Apply (Var x) (list rhs)) '())
+    (Let x (shrink-exp rhs)
+         (if (= (length body-exprs) 1)
+             (shrink-exp (car body-exprs))
+             (Begin
+               (map shrink-exp (take body-exprs (- (length body-exprs) 1)))
+               (shrink-exp (last body-exprs)))))]
+   [_ (error "Malformed let binding" e)])]
+
+    [(Begin es body)
+ (Begin (map shrink-exp es)
+        (shrink-exp body))]
 
     [(Prim op es)
      (Prim op (map shrink-exp es))]))
@@ -120,18 +141,29 @@
       [(Int n)
        (Int n)]
 
-      ;;
       [(Bool b)
        (Bool b)]
 
-      ;;
       [(If c t f)
        (If ((uniquify-exp env) c)
            ((uniquify-exp env) t)
            ((uniquify-exp env) f))]
+
       [(WhileLoop c body)
- (WhileLoop ((uniquify-exp env) c)
-            ((uniquify-exp env) body))]
+       (WhileLoop ((uniquify-exp env) c)
+                  ((uniquify-exp env) body))]
+
+      ;;
+      [(Begin es body)
+       (Begin
+        (for/list ([e es])
+          ((uniquify-exp env) e))
+        ((uniquify-exp env) body))]
+
+      ;;
+      [(SetBang x e1)
+       (SetBang (dict-ref env x)
+                ((uniquify-exp env) e1))]
 
       [(Let x e body)
        (let* ([x1 (gensym x)]
@@ -177,14 +209,23 @@
 (define (rco-exp e)
   (match e
     [(Int n) (Int n)]
+    [(Bool b) (Bool b)]          ;; ← ADD
     [(Var x) (Var x)]
+
+    [(If c t f)                  ;; ← ADD
+     (If (rco-exp c) (rco-exp t) (rco-exp f))]
+
+    [(Begin es body)             ;; ← ADD
+     (Begin (map rco-exp es) (rco-exp body))]
+
+    [(SetBang x e1)              ;; ← ADD
+     (SetBang x (rco-exp e1))]
+
+    [(WhileLoop c body)
+     (WhileLoop (rco-exp c) (rco-exp body))]
 
     [(Let x rhs body)
      (Let x (rco-exp rhs) (rco-exp body))]
-
-    [(WhileLoop c body)
-     (WhileLoop (rco-exp c)
-                (rco-exp body))]
 
     [(Prim op es)
      (define-values (atoms binds) (rco-args es))
@@ -201,24 +242,39 @@
 (define (explicate-control p)
   (match p
     [(Program info e)
-     (CProgram info
-               (list (cons 'start (explicate-tail e))))]))
+     (let ([blocks (make-hash)])
+       (define (new-label prefix)
+         (gensym prefix))
+
+       (define (emit label tail)
+         (hash-set! blocks label tail))
+
+       (define start-label 'start)
+       (emit start-label (explicate-tail e emit new-label))
+
+       (CProgram info blocks))]))
 
 
 
 
 
 
-(define (explicate-tail e)
+(define (explicate-tail e emit new-label)
   (match e
-    [(Int n)
-     (Return (Int n))]
+    ;; -----------------------------
+    ;; base cases
+    ;; -----------------------------
+    [(Int n) (Return (Int n))]
+    [(Bool b) (Return (Bool b))]
+    [(Var x) (Return (Var x))]
 
-    [(Bool b)
-     (Return (Bool b))]
+    [(Goto l) (Goto l)]
 
-    [(Var x)
-     (Return (Var x))]
+    ;; -----------------------------
+    ;; side effects
+    ;; -----------------------------
+    [(SetBang x e1)
+ (Assign (Var x) e1)]  ;; ← just the assignment, no return
 
     [(Prim 'read '())
      (Return (Prim 'read '()))]
@@ -226,21 +282,81 @@
     [(Prim op es)
      (Return (Prim op es))]
 
+    ;; -----------------------------
+    ;; IF
+    ;; -----------------------------
     [(If c t f)
-     (explicate-pred c
-                     (explicate-tail t)
-                     (explicate-tail f))]
+     (let ([thn (new-label 'then)]
+           [els (new-label 'else)])
+       (emit thn (explicate-tail t emit new-label))
+       (emit els (explicate-tail f emit new-label))
+       (explicate-pred c thn els))]
 
+    ;; -----------------------------
+    ;; WHILE  ✅ CORRECT VERSION
+    ;; -----------------------------
     [(WhileLoop c body)
-     (explicate-pred
-      c
-      (Seq (explicate-tail body)
-           (explicate-tail (WhileLoop c body)))
-      (Return (Int 0)))]
+ (let ([loop (new-label 'loop)]
+       [body-lbl (new-label 'body)]
+       [cont (new-label 'cont)])
 
+   (emit cont (Return (Int 0)))  ;; temporary placeholder
+
+   (emit loop
+     (explicate-pred c (Goto body-lbl) (Goto cont)))
+
+   (emit body-lbl
+     (append-tail
+      (explicate-effect body emit new-label)
+      (Goto loop)))
+
+   (Goto loop))]
+
+    ;; -----------------------------
+    ;; BEGIN  ✅ FIXED
+    ;; -----------------------------
+    ;; In explicate-tail, Begin case:
+[(Begin es body)
+ (let ([tail (explicate-tail body emit new-label)])
+   (foldr
+    (lambda (e acc)
+      (match e
+        [(WhileLoop c wb)
+         ;; create cont that holds the accumulated continuation
+         (let ([loop (new-label 'loop)]
+               [body-lbl (new-label 'body)]
+               [cont (new-label 'cont)])
+           (emit cont acc)  ;; ← cont gets the REAL continuation
+           (emit loop
+             (explicate-pred c (Goto body-lbl) (Goto cont)))
+           (emit body-lbl
+             (append-tail
+              (explicate-effect wb emit new-label)
+              (Goto loop)))
+           (Goto loop))]
+        [_ (append-tail (explicate-effect e emit new-label) acc)]))
+    tail
+    es))]
+    ;; -----------------------------
+    ;; LET
+    ;; -----------------------------
     [(Let x rhs body)
-     (explicate-assign x rhs (explicate-tail body))]))
+     (explicate-assign x rhs
+       (explicate-tail body emit new-label))]))
 
+(define (append-tail t1 t2)
+  (match t1
+    [(Return v)
+     t2]  ;; ← just discard, jump straight to t2
+
+    [(Seq s t)
+     (Seq s (append-tail t t2))]
+
+    [(Goto l)
+     (Goto l)]
+
+    [(IfStmt c thn els)
+     (IfStmt c thn els)]))
 
 (define (explicate-assign x rhs k)
   (match rhs
@@ -252,6 +368,9 @@
 
     [(Var y)
      (Seq (Assign (Var x) (Var y)) k)]
+
+    [(SetBang y e1)
+     (Seq (Assign (Var y) e1) k)]
 
     [(Prim 'read '())
      (Seq (Assign (Var x) (Prim 'read '())) k)]
@@ -268,13 +387,54 @@
      (explicate-assign y r
        (explicate-assign x b k))]))
 
+(define (explicate-effect e emit new-label)
+  (match e
+    ;; side effects we care about
+    [(SetBang x e1)
+     (Seq (Assign (Var x) e1) (Return (Int 0)))]
+
+    ;; while loop as an effect
+    [(WhileLoop c body)
+     (let ([loop (new-label 'loop)]
+           [body-lbl (new-label 'body)]
+           [cont (new-label 'cont)])
+
+       (emit loop
+         (explicate-pred c (Goto body-lbl) (Goto cont)))
+
+       (emit body-lbl
+         (append-tail
+          (explicate-effect body emit new-label)
+          (Goto loop)))
+
+       ;; cont is empty — just falls to whatever comes after
+       (emit cont (Return (Int 0)))
+
+       ;; entry point of the while
+       (Goto loop))]
+
+    ;; begin as an effect
+    [(Begin es body)
+     (foldr
+      (lambda (e acc)
+        (append-tail (explicate-effect e emit new-label) acc))
+      (explicate-effect body emit new-label)
+      es)]
+
+    ;; anything else, just treat as tail (Int, Var, Prim etc)
+    [_ (explicate-tail e emit new-label)]))
+
 (define (explicate-pred c thn els)
   (match c
     [(Bool #t)
-     thn]
+ (match thn
+   [(Goto l) (Goto l)]
+   [l (Goto l)])]
 
-    [(Bool #f)
-     els]
+[(Bool #f)
+ (match els
+   [(Goto l) (Goto l)]
+   [l (Goto l)])]
 
     [(If c1 t1 f1)
      (explicate-pred c1
@@ -302,6 +462,7 @@
 (define (locations-in-arg a)
   (match a
     [(Reg x) (set x)]
+    [(Var x) (set x)]
     [(Deref r _) (set r)]
     [_ (set)]))
 
@@ -322,8 +483,18 @@
     [(Instr 'negq (list d))
      (locations-in-arg d)]
 
+    ;; ADD THESE:
+    [(Instr 'cmpq (list s d))
+     (set-union (locations-in-arg s)
+                (locations-in-arg d))]
+
+    [(Instr 'pushq (list s))
+     (locations-in-arg s)]
+
+    [(Instr 'popq (list d))
+     (set)]
+
     [(Callq _ _)
-     ;; argument registers
      (set 'rdi 'rsi 'rdx 'rcx 'r8 'r9)]
 
     [_ (set)]))
@@ -341,13 +512,22 @@
     [(Instr 'negq (list d))
      (locations-in-arg d)]
 
+    ;; ADD THESE:
+    [(Instr 'cmpq _)
+     (set)]   ;; writes flags only, no registers
+
+    [(Instr 'pushq _)
+     (set)]
+
+    [(Instr 'popq (list d))
+     (locations-in-arg d)]
+
     [(Callq _ _)
-     ;; caller-saved registers
      (set 'rax 'rcx 'rdx 'rsi 'rdi 'r8 'r9 'r10 'r11)]
 
     [_ (set)]))
 
-(define (compute-live instrs)
+(define (compute-live instrs init-live)
   (define (loop rev-instrs live-after acc)
     (match rev-instrs
       ['() acc]
@@ -360,19 +540,98 @@
        (loop rest
              live-before
              (cons live-after acc))]))
-  (loop (reverse instrs) (set) '()))
+  (loop (reverse instrs) init-live '()))
+
+; this is for uncover_live rn
+(define (block-successors lbl block blocks)
+  (match block
+    [(Block _ instrs)
+     (for/fold ([succs (set)])
+               ([i instrs])
+       (match i
+         [(Jmp l)    (set-union succs (set l))]
+         [(JmpIf _ l) (set-union succs (set l))]
+         [_ succs]))]))
+
+(define (block-reads instrs)
+  (apply set-union (map reads-of-instr instrs)))
+
+(define (block-writes instrs)
+  (apply set-union (map writes-of-instr instrs)))
+
+
+(define (compute-block-liveness blocks)
+  (define live-in (make-hash))
+  (define live-out (make-hash))
+
+  ;; initialize
+  (for ([(lbl _) (in-dict blocks)])
+    (hash-set! live-in lbl (set))
+    (hash-set! live-out lbl (set)))
+
+  (define changed #t)
+
+  (let loop ()
+    (when changed
+      (set! changed #f)
+
+      (for ([(lbl block) (in-dict blocks)])
+        (match block
+          [(Block _ instrs)
+
+           ;; successors
+           (define succs (block-successors lbl block blocks))
+
+           ;; live-out = union of successors' live-in
+           (define new-out
+             (for/fold ([acc (set)])
+                       ([s (in-set succs)])
+               (set-union acc (hash-ref live-in s (set)))))
+
+           ;; live-in = R ∪ (live-out - W)
+           (define R (block-reads instrs))
+           (define W (block-writes instrs))
+           (define new-in
+             (set-union R
+                        (set-subtract new-out W)))
+
+           ;; check changes
+           (unless (equal? new-out (hash-ref live-out lbl))
+             (hash-set! live-out lbl new-out)
+             (set! changed #t))
+
+           (unless (equal? new-in (hash-ref live-in lbl))
+             (hash-set! live-in lbl new-in)
+             (set! changed #t))]))
+
+      ;; only recurse if changed
+      (loop)))
+
+  (values live-in live-out))
+
+
 
 
 (define (uncover_live p)
   (match p
     [(X86Program info blocks)
-     (X86Program info
+
+     (define-values (live-in live-out)
+       (compute-block-liveness blocks))
+
+     (define new-blocks
        (for/hash ([(lbl block) (in-dict blocks)])
          (match block
            [(Block _ instrs)
-            (define lives (compute-live instrs))
+            (define init-live (hash-ref live-out lbl (set)))
+            (define lives (compute-live instrs init-live))
+
+            
+
             (values lbl
-                    (Block `(lives ,lives) instrs))])))]))
+                    (Block `(lives ,lives) instrs))])))
+
+     (X86Program info new-blocks)]))
 
 
 
@@ -456,7 +715,16 @@
         (Reg (hash-ref reg-env x))]
        [(hash-has-key? spill-env x)
         (Deref 'rbp (hash-ref spill-env x))]
-       [else a])]
+       [else (Reg x)])]   ;; keep as register if already physical
+
+    [(Var x)
+     (cond
+       [(hash-has-key? reg-env x)
+        (Reg (hash-ref reg-env x))]
+       [(hash-has-key? spill-env x)
+        (Deref 'rbp (hash-ref spill-env x))]
+       [else (error "unallocated var" x)])]
+
     [_ a]))
 
 
@@ -505,14 +773,21 @@
 (define (select-tail t)
   (match t
     [(Return e)
-     (select-exp e 'rax)]
+     (append (select-exp e 'rax)
+             (list (Jmp 'conclusion)))]  ;; ← ADD THIS
 
     [(Seq s t2)
      (append (select-stmt s)
              (select-tail t2))]
 
     [(IfStmt c thn els)
-     (select-pred c thn els)]))
+     (match* (thn els)
+       [((Goto l1) (Goto l2))
+        (select-pred c l1 l2)])]
+
+    [(Goto l)
+     (list (Jmp l))]))
+
 
 (define (select-pred c thn els)
   (match c
@@ -524,13 +799,22 @@
 
     [(Prim 'eq? (list a b))
      (append (select-exp a 'rax)
-             (select-exp b 'rbx)
+             (select-exp b 'r11)
              (list
-              (Instr 'cmpq (list (Reg 'rbx) (Reg 'rax)))
+              (Instr 'cmpq (list (Reg 'r11) (Reg 'rax)))
               (JmpIf 'e thn)
               (Jmp els)))]
 
-    [_
+    ;;
+    [(Prim '< (list a b))
+     (append (select-exp a 'rax)
+             (select-exp b 'r11)
+             (list
+              (Instr 'cmpq (list (Reg 'r11) (Reg 'rax)))
+              (JmpIf 'l thn)
+              (Jmp els)))]
+
+    [_  ;; fallback
      (append (select-exp c 'rax)
              (list
               (Instr 'cmpq (list (Imm 0) (Reg 'rax)))
@@ -554,7 +838,13 @@
      (list (Instr 'movq (list (Imm n) (Reg dst))))]
 
     [(Var x)
-     (list (Instr 'movq (list (Reg x) (Reg dst))))]
+ (list (Instr 'movq (list (Reg x) (Reg dst))))]
+
+    [(Bool #t)
+     (list (Instr 'movq (list (Imm 1) (Reg dst))))]
+
+    [(Bool #f)
+     (list (Instr 'movq (list (Imm 0) (Reg dst))))]
 
     ;; addition
     [(Prim '+ (list a b))
@@ -596,6 +886,12 @@
   (match arg
     [(Var x)
      (Deref 'rbp (dict-ref env x))]
+
+    [(Reg x)
+     (if (is-var? x)
+         (Deref 'rbp (dict-ref env x))
+         (Reg x))]
+
     [else arg]))
 
 
@@ -618,6 +914,10 @@
 (define (collect-vars-in-arg a)
   (match a
     [(Var x) (set x)]
+    [(Reg x)
+     (if (is-var? x)
+         (set x)
+         (set))]
     [else (set)]))
 
 (define (collect-vars-in-instr i)
@@ -662,9 +962,8 @@
 (define (patch-instr i)
   (match i
     [(Instr 'movq (list s d))
- #:when (equal? s d)
- '()]
-
+     #:when (equal? s d)
+     '()]
 
     [(Instr 'movq (list s d))
      (if (and (mem? s) (mem? d))
@@ -677,6 +976,13 @@
      (if (and (mem? s) (mem? d))
          (list (Instr 'movq (list s patch-scratch))
                (Instr op (list patch-scratch d)))
+         (list i))]
+
+    ;; ADD THIS:
+    [(Instr 'cmpq (list s d))
+     (if (and (mem? s) (mem? d))
+         (list (Instr 'movq (list s patch-scratch))
+               (Instr 'cmpq (list patch-scratch d)))
          (list i))]
 
     [else (list i)]))
@@ -757,22 +1063,30 @@
     [(X86Program info blocks)
      (define size (stack-size blocks))
 
+     (define conclusion-block
+       (Block '() (epilogue size)))
+
      (define new-blocks
        (for/hash ([(lbl block) (in-dict blocks)])
          (match block
-           [(Block info instrs)
-            (cond
-              [(eq? lbl 'start)
-               (values 'start
-                 (Block info
-                   (append
-                     (prologue size)
-                     (remove-ret instrs)
-                     (epilogue size))))]
-              [else
-               (values lbl block)])])))
+           [(Block info2 instrs)
+            (if (eq? lbl 'start)
+                (values 'main
+                  (Block info2
+                    (append (prologue size) instrs)))
+                (values lbl block))])))
 
-     (X86Program info new-blocks)]))
+     (X86Program
+       (cons (Global 'main) info)
+       (hash-set new-blocks 'conclusion conclusion-block))]))
+
+(define (replace-ret-with-jmp instrs conclusion-lbl)
+  (apply append
+    (map (λ (i)
+           (match i
+             [(Retq) (list (Jmp conclusion-lbl))]
+             [_ (list i)]))
+         instrs)))
 
 
 (define (remove-ret instrs)
@@ -814,6 +1128,7 @@
     ("uncover_live" ,uncover_live ,interp-pseudo-x86-1)
     ("build_interference" ,build_interference ,interp-pseudo-x86-1)
     ("allocate_registers" ,allocate_registers ,interp-pseudo-x86-1)
+    ;("assign_homes" ,assign-homes ,interp-x86-1)
     ("patch_instructions" ,patch-instructions ,interp-x86-1)
-    ;("prelude-and-conclusion" ,prelude-and-conclusion ,interp-x86-1)
+    ("prelude-and-conclusion" ,prelude-and-conclusion ,interp-x86-1)
      ))

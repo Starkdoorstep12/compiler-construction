@@ -36,13 +36,14 @@
 ; interp-Lif
 ; "lif_test"
 ; (tests-for "lif"))
-(interp-tests
- "lif"
- type-check-Lwhile
- compiler-passes
- interp-Lwhile
- "lif_test"
- (tests-for "lif"))
+;(interp-tests
+; "lif"
+; type-check-Lwhile
+; compiler-passes
+; interp-Lwhile
+; "lif_test"
+; (tests-for "lif"))
 ;; Uncomment the following when all the passes are complete to
 ;; test the final x86 code.
-;(compiler-tests "while" #f compiler-passes "while_test" (tests-for "while"))
+(compiler-tests "lif" #f compiler-passes "lif_test" (tests-for "lif"))
+(compiler-tests "lwhile" #f compiler-passes "lwhile_test" (tests-for "lwhile"))

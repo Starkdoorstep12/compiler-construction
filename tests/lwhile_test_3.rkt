@@ -1,0 +1,5 @@
+(let ([x 0])
+  (let ([y 10])
+    (while (< x 5)
+      (set! x (+ x 1)))
+    y))
