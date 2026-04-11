@@ -47,3 +47,4 @@
 ;; test the final x86 code.
 (compiler-tests "lif" #f compiler-passes "lif_test" (tests-for "lif"))
 (compiler-tests "lwhile" #f compiler-passes "lwhile_test" (tests-for "lwhile"))
+(compiler-tests "vectors" #f compiler-passes "vectors_test" (tests-for "vectors"))
