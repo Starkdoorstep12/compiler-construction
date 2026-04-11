@@ -1128,7 +1128,9 @@
       (Instr 'movq (list (Imm tag) (Deref dst 0))))]
 
     [(Prim 'vector-ref (list (Var v) (Int i)))
-     (list (Instr 'movq (list (Deref v (* 8 (+ i 1))) (Reg dst))))]
+     (list
+      (Instr 'movq (list (Reg v) (Reg 'r11)))
+      (Instr 'movq (list (Deref 'r11 (* 8 (+ i 1))) (Reg dst))))]
 
     [(Prim 'vector-set! (list (Var v) (Int i) val))
      (append
