@@ -487,10 +487,13 @@
 (define (append-tail t1 t2)
   (match t1
     [(Return v)
-     t2]  ;; ← just discard, jump straight to t2
+     (Seq (Assign (Var (gensym 'tmp)) v) t2)]
 
     [(Seq s t)
      (Seq s (append-tail t t2))]
+
+    [(Assign x e)                      ;; ← ADD THIS
+     (Seq (Assign x e) t2)]
 
     [(Goto l)
      (Goto l)]
@@ -597,9 +600,8 @@
      (Seq (Collect n) (Return (Void)))]
 
     [(Prim 'vector-set! (list e (Int i) val))
-     (Seq (Assign (Var (gensym 'tmp))
-                  (Prim 'vector-set! (list e (Int i) val)))
-          (Return (Void)))]
+ (Assign (Var (gensym 'tmp))
+         (Prim 'vector-set! (list e (Int i) val)))]
 
     ;; anything else, just treat as tail (Int, Var, Prim etc)
     [_ (explicate-tail e emit new-label)]))
@@ -1036,10 +1038,17 @@
   (match s
     ;; vector-set! must come BEFORE general Assign case
     [(Assign (Var _) (Prim 'vector-set! (list (Var v) (Int i) val)))
-     (append
-      (select-exp val 'r11)
-      (list
-       (Instr 'movq (list (Reg 'r11) (Deref v (* 8 (+ i 1)))))))]
+     (match val
+       [(Var src)
+        (list
+         (Instr 'movq (list (Reg v) (Reg 'r11)))
+         (Instr 'movq (list (Reg src) (Deref 'r11 (* 8 (+ i 1))))))]
+       [_
+        (append
+         (select-exp val 'rax)
+         (list
+          (Instr 'movq (list (Reg v) (Reg 'r11)))
+          (Instr 'movq (list (Reg 'rax) (Deref 'r11 (* 8 (+ i 1)))))))])]
 
     [(Assign (Var x) e)
      (select-exp e x)]
