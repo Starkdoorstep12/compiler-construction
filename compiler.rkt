@@ -643,9 +643,7 @@
      (explicate-pred c (Goto body-lbl) (Goto cont) emit new-label))
 
    (emit body-lbl
-     (append-tail
-      (explicate-effect body emit new-label)
-      (Goto loop)))
+     (explicate-effect-with-cont body (Goto loop) emit new-label))
 
    (Goto loop))]
 
@@ -659,18 +657,27 @@
     (lambda (e acc)
       (match e
         [(WhileLoop c wb)
-         ;; create cont that holds the accumulated continuation
          (let ([loop (new-label 'loop)]
                [body-lbl (new-label 'body)]
                [cont (new-label 'cont)])
-           (emit cont acc)  ;; ← cont gets the REAL continuation
+           (emit cont acc)
+           (emit loop
+             (explicate-pred c (Goto body-lbl) (Goto cont) emit new-label))
+           (emit body-lbl
+             (explicate-effect-with-cont wb (Goto loop) emit new-label))
+           (Goto loop))]
+        [(Let x rhs (WhileLoop c wb))
+         (let ([loop (new-label 'loop)]
+               [body-lbl (new-label 'body)]
+               [cont (new-label 'cont)])
+           (emit cont acc)
            (emit loop
              (explicate-pred c (Goto body-lbl) (Goto cont) emit new-label))
            (emit body-lbl
              (append-tail
               (explicate-effect wb emit new-label)
               (Goto loop)))
-           (Goto loop))]
+           (explicate-assign x rhs (Goto loop) emit new-label))]
         [_ (append-tail (explicate-effect e emit new-label) acc)]))
     tail
     es))]
@@ -753,6 +760,18 @@
           [_ (append-tail (explicate-effect e emit new-label) acc)]))
       final
       es)]
+    [(WhileLoop c body)
+     (let ([loop (new-label 'loop)]
+           [body-lbl (new-label 'body)]
+           [cont (new-label 'cont)])
+       (emit cont k)
+       (emit loop
+         (explicate-pred c (Goto body-lbl) (Goto cont) emit new-label))
+       (emit body-lbl
+         (append-tail
+          (explicate-effect body emit new-label)
+          (Goto loop)))
+       (Goto loop))]
 
     [(Let y r b)
      (explicate-assign y r
@@ -773,6 +792,44 @@
      [_ fun]))
  (Seq (Assign (Var x) (Call fun^ processed-args)) k)]))
 
+
+(define (explicate-effect-with-cont e cont emit new-label)
+  (match e
+    [(Begin es body)
+     (foldr
+      (lambda (e acc)
+        (match e
+          [(WhileLoop c wb)
+           (let ([loop (new-label 'loop)]
+                 [body-lbl (new-label 'body)]
+                 [cont-lbl (new-label 'cont)])
+             (emit cont-lbl acc)
+             (emit loop
+               (explicate-pred c (Goto body-lbl) (Goto cont-lbl) emit new-label))
+             (emit body-lbl
+               (explicate-effect-with-cont wb (Goto loop) emit new-label))
+             (Goto loop))]
+          [(Let x rhs wb)
+           (explicate-assign x rhs
+             (match wb
+               [(WhileLoop c body-w)
+                (let ([loop (new-label 'loop)]
+                      [body-lbl (new-label 'body)]
+                      [cont-lbl (new-label 'cont)])
+                  (emit cont-lbl acc)
+                  (emit loop
+                    (explicate-pred c (Goto body-lbl) (Goto cont-lbl) emit new-label))
+                  (emit body-lbl
+                    (explicate-effect-with-cont body-w (Goto loop) emit new-label))
+                  (Goto loop))]
+               [_ (append-tail (explicate-effect e emit new-label) acc)])
+             emit new-label)]
+          [_ (append-tail (explicate-effect e emit new-label) acc)]))
+      (append-tail (explicate-effect body emit new-label) cont)
+      es)]
+    [_ (append-tail (explicate-effect e emit new-label) cont)]))
+
+
 (define (explicate-effect e emit new-label)
   (match e
     ;; side effects we care about
@@ -784,26 +841,48 @@
      (let ([loop (new-label 'loop)]
            [body-lbl (new-label 'body)]
            [cont (new-label 'cont)])
-
        (emit loop
          (explicate-pred c (Goto body-lbl) (Goto cont) emit new-label))
-
        (emit body-lbl
-         (append-tail
-          (explicate-effect body emit new-label)
-          (Goto loop)))
-
-       ;; cont is empty — just falls to whatever comes after
+         (explicate-effect-with-cont body (Goto loop) emit new-label))
        (emit cont (Return (Int 0)))
-
-       ;; entry point of the while
        (Goto loop))]
 
     ;; begin as an effect
-    [(Begin es body)
+   [(Begin es body)
      (foldr
       (lambda (e acc)
-        (append-tail (explicate-effect e emit new-label) acc))
+        (match e
+          [(WhileLoop c wb)
+           (let ([loop (new-label 'loop)]
+                 [body-lbl (new-label 'body)]
+                 [cont (new-label 'cont)])
+             (emit cont acc)
+             (emit loop
+               (explicate-pred c (Goto body-lbl) (Goto cont) emit new-label))
+             (emit body-lbl
+               (append-tail
+                (explicate-effect wb emit new-label)
+                (Goto loop)))
+             (Goto loop))]
+          [(Let x rhs wb)
+           (explicate-assign x rhs
+             (match wb
+               [(WhileLoop c body-w)
+                (let ([loop (new-label 'loop)]
+                      [body-lbl (new-label 'body)]
+                      [cont (new-label 'cont)])
+                  (emit cont acc)
+                  (emit loop
+                    (explicate-pred c (Goto body-lbl) (Goto cont) emit new-label))
+                  (emit body-lbl
+                    (append-tail
+                     (explicate-effect body-w emit new-label)
+                     (Goto loop)))
+                  (Goto loop))]
+               [_ (append-tail (explicate-effect wb emit new-label) acc)])
+             emit new-label)]
+          [_ (append-tail (explicate-effect e emit new-label) acc)]))
       (explicate-effect body emit new-label)
       es)]
 
@@ -827,8 +906,15 @@
      (Seq (Collect n) (Return (Void)))]
 
     [(Prim 'vector-set! (list e (Int i) val))
- (Assign (Var (gensym 'tmp))
-         (Prim 'vector-set! (list e (Int i) val)))]
+     (Seq (Assign (Var (gensym 'tmp))
+                  (Prim 'vector-set! (list e (Int i) val)))
+          (Return (Void)))]
+
+    ;; anything else, just treat as tail (Int, Var, Prim etc)
+    [(Let x rhs body)
+     (explicate-assign x rhs
+       (explicate-effect body emit new-label)
+       emit new-label)]
 
     ;; anything else, just treat as tail (Int, Var, Prim etc)
     [_ (explicate-tail e emit new-label)]))
