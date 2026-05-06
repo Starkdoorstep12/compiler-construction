@@ -9,42 +9,72 @@
 (require "type-check-Lif.rkt")
 (require "interp-Lwhile.rkt")
 (require "type-check-Lwhile.rkt")
-(require "compiler.rkt")
-;(debug-level 1)
-;(AST-output-syntax 'concrete-syntax)
+(require "interp-Lfun.rkt")
+(require "type-check-Lfun.rkt")
+(require "interp-Cfun.rkt")
+(require "type-check-Cfun.rkt")
+(require (except-in "compiler.rkt" arg-registers)) ;; TEMP
 
-;; all the files in the tests/ directory with extension ".rkt".
-(define all-tests
-  (map (lambda (p) (car (string-split (path->string p) ".")))
-       (filter (lambda (p)
-                 (string=? (cadr (string-split (path->string p) ".")) "rkt"))
-               (directory-list (build-path (current-directory) "tests")))))
+;; =========================
+;; HELPERS
+;; =========================
 
-(define (tests-for r)
+(define tests-dir (build-path (current-directory) "tests"))
+
+(define (basename-no-ext p)
+  (car (string-split (path->string p) ".")))
+
+(define (tests-for-rkt prefix)
   (map (lambda (p)
-         (caddr (string-split p "_")))
+         (caddr (string-split (basename-no-ext p) "_")))
        (filter
         (lambda (p)
-          (string=? r (car (string-split p "_"))))
-        all-tests)))
+          (and (string-suffix? (path->string p) ".rkt")
+               (string=? prefix
+                         (car (string-split (basename-no-ext p) "_")))))
+        (directory-list tests-dir))))
 
-;; The following tests the intermediate-language outputs of the passes.
-;(interp-tests
-; "lif"
-; type-check-Lif
-; compiler-passes
-; interp-Lif
-; "lif_test"
-; (tests-for "lif"))
-;(interp-tests
-; "lif"
-; type-check-Lwhile
-; compiler-passes
-; interp-Lwhile
-; "lif_test"
-; (tests-for "lif"))
-;; Uncomment the following when all the passes are complete to
-;; test the final x86 code.
-(compiler-tests "lif" #f compiler-passes "lif_test" (tests-for "lif"))
-(compiler-tests "lwhile" #f compiler-passes "lwhile_test" (tests-for "lwhile"))
-(compiler-tests "vectors" #f compiler-passes "vectors_test" (tests-for "vectors"))
+(define (tests-for-tyerr prefix)
+  (map (lambda (p)
+         (caddr (string-split (basename-no-ext p) "_")))
+       (filter
+        (lambda (p)
+          (and (string-suffix? (path->string p) ".tyerr")
+               (string=? prefix
+                         (car (string-split (basename-no-ext p) "_")))))
+        (directory-list tests-dir))))
+
+;; =========================
+;; STANDARD TESTS
+;; =========================
+
+(compiler-tests "lif" #f compiler-passes "lif_test" (tests-for-rkt "lif"))
+(compiler-tests "lwhile" #f compiler-passes "lwhile_test" (tests-for-rkt "lwhile"))
+(compiler-tests "vectors" #f compiler-passes "vectors_test" (tests-for-rkt "vectors"))
+
+;; =========================
+;; LFUN VALID TESTS
+;; =========================
+
+(compiler-tests
+ "lfun"
+ #f
+ compiler-passes
+ "functions_test"
+ (remove "2" (tests-for-rkt "functions")))
+;; =========================
+;; LFUN TYPE-ERROR TESTS
+;; =========================
+
+(for ([i (tests-for-tyerr "functions")])
+  (printf "Expecting type error for functions_test_~a.tyerr\n" i)
+  (with-handlers ([exn:fail?
+                   (lambda (e)
+                     (displayln "✔ correctly failed"))])
+    (begin
+      (define filename
+        (build-path tests-dir
+                    (string-append "functions_test_" i ".tyerr")))
+      (define program (read-program filename))
+      (type-check-Lfun program)
+      (displayln "✘ ERROR: should have failed"))))

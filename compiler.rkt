@@ -21,6 +21,10 @@
 
 (require "interp-Cwhile.rkt")
 (require "type-check-Cwhile.rkt")
+(require "interp-Lfun.rkt")
+(require "type-check-Lfun.rkt")
+(require "interp-Cfun.rkt")
+(require "type-check-Cfun.rkt")
 (require "utilities.rkt")
 (provide (all-defined-out))
 (require graph)
@@ -113,10 +117,24 @@
 
     [(Collect n) (Collect n)]
 
+    [(FunRef f n) (FunRef f n)]
+
+[(Apply fun args)
+ (Apply (shrink-exp fun) (map shrink-exp args))]
+
     [(Prim op es)
      (Prim op (map shrink-exp es))]))
+(define (shrink-def d)
+  (match d
+    [(Def f params rt info body)
+     (Def f params rt info (shrink-exp body))]))
+
 (define (shrink p)
   (match p
+    [(ProgramDefsExp info ds body)
+     (define ds^ (map shrink-def ds))
+     (define main-def (Def 'main '() 'Integer '() (shrink-exp body)))
+     (ProgramDefs info (append ds^ (list main-def)))]
     [(Program info e)
      (Program info (shrink-exp e))]))
 ;; Next we have the partial evaluation pass described in the book.
@@ -151,7 +169,7 @@
   (lambda (e)
     (match e
       [(Var x)
-       (Var (dict-ref env x))]
+       (Var (dict-ref env x x))]
 
       [(Int n)
        (Int n)]
@@ -198,22 +216,92 @@
 
       [(Collect n) (Collect n)]
 
+      [(FunRef f n) (FunRef f n)]
+      [(Apply fun args)
+ (Apply ((uniquify-exp env) fun)
+        (map (uniquify-exp env) args))]
+
       [(Prim op es)
        (Prim op
              (for/list ([e es])
                ((uniquify-exp env) e)))])))
 
 ;; uniquify : Lvar -> Lvar
+(define (uniquify-def d)
+  (match d
+    [(Def f (list `[,xs : ,ps] ...) rt info body)
+     (define env
+       (for/fold ([env '()])
+                 ([x xs])
+         (dict-set env x (gensym x))))
+     (define new-params
+       (for/list ([x xs] [p ps])
+         `[,(dict-ref env x) : ,p]))
+     (Def f new-params rt info ((uniquify-exp env) body))]))
+
 (define (uniquify p)
   (match p
-    [(Program info e) (Program info ((uniquify-exp '()) e))]))
+  ;; NEW CASE — REQUIRED
+  [(ProgramDefsExp info ds body)
+   (ProgramDefsExp
+    info
+    (map uniquify-def ds)
+    ((uniquify-exp '()) body))]
+
+  [(ProgramDefs info ds)
+   (ProgramDefs info (map uniquify-def ds))]
+
+  [(Program info e)
+   (Program info ((uniquify-exp '()) e))]))
+
+
+(define (reveal-functions-exp funs)
+  (lambda (e)
+    (define recur (reveal-functions-exp funs))
+    (match e
+      [(Var x)
+       (if (set-member? funs x)
+           (FunRef x 0)
+           (Var x))]
+      [(FunRef f n) (FunRef f n)]
+      [(Apply fun args)
+       (Apply (recur fun) (map recur args))]
+      [(Let x rhs body) (Let x (recur rhs) (recur body))]
+      [(If c t f) (If (recur c) (recur t) (recur f))]
+      [(WhileLoop c body) (WhileLoop (recur c) (recur body))]
+      [(Begin es body) (Begin (map recur es) (recur body))]
+      [(SetBang x e1) (SetBang x (recur e1))]
+      [(Prim op es) (Prim op (map recur es))]
+      [_ e])))
+
+(define (reveal-functions-def funs d)
+  (match d
+    [(Def f params rt info body)
+     (Def f params rt info ((reveal-functions-exp funs) body))]))
+
+(define (reveal-functions p)
+  (match p
+    ;; ✅ ADD THIS CASE
+    [(ProgramDefsExp info ds body)
+     (define funs (list->set (map Def-name ds)))
+     (ProgramDefsExp
+      info
+      (map (lambda (d) (reveal-functions-def funs d)) ds)
+      ((reveal-functions-exp funs) body))]
+
+    [(ProgramDefs info ds)
+     (define funs (list->set (map Def-name ds)))
+     (ProgramDefs info (map (lambda (d) (reveal-functions-def funs d)) ds))]
+
+    [(Program info e)
+     (Program info ((reveal-functions-exp (set)) e))]))
 
 (define (atomic? e)
   (match e
     [(Int _) #t]
     [(Var _) #t]
+    [(FunRef _ _) #t]
     [else #f]))
-
 (define (rco-atom e)
   (define e1 (rco-exp e))
   (if (atomic? e1)
@@ -273,6 +361,14 @@
      (define-values (a2 b2) (rco-atom val))
      (make-lets (append b1 b2)
                 (Prim 'vector-set! (list a1 (Int i) a2)))]
+
+    [(FunRef f n) (FunRef f n)]
+
+[(Apply fun args)
+ (define-values (f-atom f-binds) (rco-atom fun))
+ (define-values (arg-atoms arg-binds) (rco-args args))
+ (make-lets (append f-binds arg-binds)
+            (Apply f-atom arg-atoms))]
 
     [(Prim op es)
      (define-values (atoms binds) (rco-args es))
@@ -350,18 +446,51 @@
     [(SetBang x e)
      (SetBang x (expose-alloc-exp e))]
 
+    [(FunRef f n) (FunRef f n)]
+
+[(Apply fun args)
+ (Apply (expose-alloc-exp fun) (map expose-alloc-exp args))]
+
     [(Prim op es)
      (Prim op (map expose-alloc-exp es))]))
 
+(define (expose-alloc-def d)
+  (match d
+    [(Def f params rt info body)
+     (Def f params rt info (expose-alloc-exp body))]))
+
 (define (expose-allocation p)
   (match p
+    [(ProgramDefsExp info ds body)
+     (ProgramDefsExp
+      info
+      (map expose-alloc-def ds)
+      (expose-alloc-exp body))]
+
+    [(ProgramDefs info ds)
+     (ProgramDefs info (map expose-alloc-def ds))]
+
     [(Program info e)
      (Program info (expose-alloc-exp e))]))
 
 
 ;; remove-complex-opera* : Lvar -> Lvar^mon
+(define (rco-def d)
+  (match d
+    [(Def f params rt info body)
+     (Def f params rt info (rco-exp body))]))
+
 (define (remove-complex-opera* p)
   (match p
+    [(ProgramDefsExp info ds body)
+     (ProgramDefsExp
+      info
+      (map rco-def ds)
+      (rco-exp body))]
+
+    [(ProgramDefs info ds)
+     (ProgramDefs info (map rco-def ds))]
+
     [(Program info e)
      (Program info (rco-exp e))]))
 
@@ -369,20 +498,74 @@
 ;; explicate-control : Lvar^mon -> Cvar
 (define (explicate-control p)
   (match p
+
+    ;; ================================
+    ;; LFUN ENTRY CASE
+    ;; ================================
+    [(ProgramDefsExp info ds body)
+
+     ;; process function definitions
+     (define new-ds
+       (map (lambda (d)
+              (match d
+                [(Def f (list `[,xs : ,ps] ...) rt def-info body)
+                 (define blocks (make-hash))
+                 (define (new-label prefix) (gensym prefix))
+                 (define (emit label tail) (hash-set! blocks label tail))
+
+                 ;; ✅ FIX: proper label
+                 (define start-label (symbol-append f '_start))
+                 (emit start-label (explicate-tail body emit new-label))
+
+                 (Def f (for/list ([x xs] [p ps]) `[,x : ,p]) rt def-info blocks)]))
+            ds))
+
+     ;; process main body → becomes function
+     (define blocks (make-hash))
+     (define (new-label prefix) (gensym prefix))
+     (define (emit label tail) (hash-set! blocks label tail))
+
+     ;; ✅ FIX: main_start instead of 'start
+     (define start-label (symbol-append 'main '_start))
+     (emit start-label (explicate-tail body emit new-label))
+
+     (ProgramDefs
+      info
+      (append new-ds
+              (list (Def 'main '() 'Integer '() blocks))))]
+
+    ;; ================================
+    ;; ProgramDefs (already lowered)
+    ;; ================================
+    [(ProgramDefs info ds)
+     (define new-ds
+       (map (lambda (d)
+              (match d
+                [(Def f (list `[,xs : ,ps] ...) rt def-info body)
+                 (define blocks (make-hash))
+                 (define (new-label prefix) (gensym prefix))
+                 (define (emit label tail) (hash-set! blocks label tail))
+
+                 ;; ✅ consistent label
+                 (define start-label (symbol-append f '_start))
+                 (emit start-label (explicate-tail body emit new-label))
+
+                 (Def f (for/list ([x xs] [p ps]) `[,x : ,p]) rt def-info blocks)]))
+            ds))
+     (ProgramDefs info new-ds)]
+
+    ;; ================================
+    ;; OLD PATH (no functions)
+    ;; ================================
     [(Program info e)
      (let ([blocks (make-hash)])
-       (define (new-label prefix)
-         (gensym prefix))
+       (define (new-label prefix) (gensym prefix))
+       (define (emit label tail) (hash-set! blocks label tail))
 
-       (define (emit label tail)
-         (hash-set! blocks label tail))
-
-       (define start-label 'start)
-       (emit start-label (explicate-tail e emit new-label))
+       ;; keep old behavior for non-Lfun
+       (emit 'start (explicate-tail e emit new-label))
 
        (CProgram info blocks))]))
-
-
 
 
 
@@ -421,6 +604,13 @@
 
     [(Prim op es)
      (Return (Prim op es))]
+
+[(Apply fun args)
+ (define fun-atom
+   (match fun
+     [(FunRef f _) (Var f)]
+     [_ fun]))
+ (Return (Call fun-atom args))]
 
     ;; -----------------------------
     ;; IF
@@ -560,7 +750,19 @@
     [(Let y r b)
      (explicate-assign y r
        (explicate-assign x b k emit new-label)
-       emit new-label)]))
+       emit new-label)]
+
+    [(Apply fun args)
+
+ (define fun-atom
+   (match fun
+     [(FunRef f _) (Var f)]
+     [_ fun]))
+
+ (Seq
+  (Assign (Var x)
+          (Call fun-atom args))
+  k)]))
 
 (define (explicate-effect e emit new-label)
   (match e
@@ -595,6 +797,18 @@
         (append-tail (explicate-effect e emit new-label) acc))
       (explicate-effect body emit new-label)
       es)]
+
+    [(Apply fun args)
+
+ (define fun-atom
+   (match fun
+     [(FunRef f _) (Var f)]
+     [_ fun]))
+
+ (Seq
+  (Assign (Var (gensym 'tmp))
+          (Call fun-atom args))
+  (Return (Void)))]
 
     [(Collect n)
      (Seq (Collect n) (Return (Void)))]
@@ -637,11 +851,21 @@
 ;; select-instructions : Cvar -> x86var
 (define (select-instructions p)
   (match p
+    [(ProgramDefs info ds)
+     (define new-ds
+       (map (lambda (d)
+              (match d
+                [(Def f params rt def-info blocks)
+                 (define new-blocks
+                   (for/hash ([(lbl tail) (in-dict blocks)])
+                     (values lbl (Block '() (select-tail tail)))))
+                 (Def f params rt def-info new-blocks)]))
+            ds))
+     (X86ProgramDefs info new-ds)]
     [(CProgram info blocks)
      (X86Program info
        (for/hash ([(lbl tail) (in-dict blocks)])
-         (values lbl
-                 (Block '() (select-tail tail)))))]))
+         (values lbl (Block '() (select-tail tail)))))]))
 
 
 ; we are doing 3.2 which is uncover_live
@@ -689,6 +913,18 @@
     [(Instr 'addq (list _ (Global _)))
      (set)]
 
+    [(IndirectCallq (Reg r) _)
+ (set-union (set r) (set 'rdi 'rsi 'rdx 'rcx 'r8 'r9))]
+
+[(TailJmp (Reg r) _)
+ (set-union (set r) (set 'rdi 'rsi 'rdx 'rcx 'r8 'r9))]
+
+[(TailJmp (Global _) _)
+ (set 'rdi 'rsi 'rdx 'rcx 'r8 'r9)]
+
+[(Instr 'leaq (list s d))
+ (set)]
+
     [_ (set)]))
 
 
@@ -724,6 +960,14 @@
 
     [(Instr 'addq (list _ (Global _)))
      (set)]
+
+    [(IndirectCallq _ _)
+ (set 'rax 'rcx 'rdx 'rsi 'rdi 'r8 'r9 'r10 'r11)]
+
+[(TailJmp _ _) (set)]
+
+[(Instr 'leaq (list s d))
+ (locations-in-arg d)]
 
     [_ (set)]))
 
@@ -812,75 +1056,95 @@
 
 
 
-(define (uncover_live p)
-  (match p
-    [(X86Program info blocks)
-
-     (define-values (live-in live-out)
-       (compute-block-liveness blocks))
-
+(define (uncover-live-def d)
+  (match d
+    [(Def f params rt def-info blocks)
+     (define-values (live-in live-out) (compute-block-liveness blocks))
      (define new-blocks
        (for/hash ([(lbl block) (in-dict blocks)])
          (match block
            [(Block _ instrs)
             (define init-live (hash-ref live-out lbl (set)))
             (define lives (compute-live instrs init-live))
+            (values lbl (Block `(lives ,lives) instrs))])))
+     (Def f params rt def-info new-blocks)]))
 
-            
-
-            (values lbl
-                    (Block `(lives ,lives) instrs))])))
-
+(define (uncover_live p)
+  (match p
+    [(X86ProgramDefs info ds)
+     (X86ProgramDefs info (map uncover-live-def ds))]
+    [(X86Program info blocks)
+     (define-values (live-in live-out)
+       (compute-block-liveness blocks))
+     (define new-blocks
+       (for/hash ([(lbl block) (in-dict blocks)])
+         (match block
+           [(Block _ instrs)
+            (define init-live (hash-ref live-out lbl (set)))
+            (define lives (compute-live instrs init-live))
+            (values lbl (Block `(lives ,lives) instrs))])))
      (X86Program info new-blocks)]))
 
 
 
+(define (build-interference-blocks blocks g)
+
+  ;; PASS 1: ensure all variables are vertices
+  (for ([(lbl block) (in-dict blocks)])
+    (match block
+      [(Block `(lives ,live-list) instrs)
+
+       ;; add variables from live sets
+       (for ([live live-list])
+         (for ([v (in-set live)])
+           (when (is-var? v)
+             (add-vertex! g v))))
+
+       ;; add variables from instructions (writes + reads)
+       (for ([i instrs])
+
+         ;; writes
+         (for ([v (in-set (writes-of-instr i))])
+           (when (is-var? v)
+             (add-vertex! g v)))
+
+         ;; 🔥 FIX: reads (this was missing)
+         (for ([v (in-set (reads-of-instr i))])
+           (when (is-var? v)
+             (add-vertex! g v))))]))
+
+  ;; PASS 2: add interference edges
+  (for ([(lbl block) (in-dict blocks)])
+    (match block
+      [(Block `(lives ,live-list) instrs)
+       (for ([i instrs] [live-after live-list])
+         (define W (writes-of-instr i))
+         (for ([w (in-set W)])
+           (when (is-var? w)
+             (define neighbors
+               (match i
+                 [(Instr 'movq (list s d))
+                  (set-subtract live-after (locations-in-arg s))]
+                 [_ live-after]))
+             (for ([v (in-set neighbors)])
+               (when (and (is-var? v) (not (equal? v w)))
+                 (add-edge! g w v))))))])))
+
+(define (build-interference-def d)
+  (match d
+    [(Def f params rt def-info blocks)
+     (define g (undirected-graph '()))
+     (build-interference-blocks blocks g)
+     (Def f params rt (dict-set def-info 'conflicts g) blocks)]))
+
 (define (build_interference p)
   (match p
+    [(X86ProgramDefs info ds)
+     (X86ProgramDefs info (map build-interference-def ds))]
     [(X86Program info blocks)
      (define g (undirected-graph '()))
-
-     ;; First add all vertices
-(for ([(lbl block) (in-dict blocks)])
-  (match block
-    [(Block `(lives ,live-list) instrs)
-     ;; from live sets
-     (for ([live live-list])
-       (for ([v (in-set live)])
-         (when (is-var? v)
-           (add-vertex! g v))))
-     ;; from write sets - catch variables written but never live
-     (for ([i instrs])
-       (for ([v (in-set (writes-of-instr i))])
-         (when (is-var? v)
-           (add-vertex! g v))))]))
-
-
-     ;; Now add edges
-     (for ([(lbl block) (in-dict blocks)])
-       (match block
-         [(Block `(lives ,live-list) instrs)
-          (for ([i instrs]
-                [live-after live-list])
-            (define W (writes-of-instr i))
-            (define R (reads-of-instr i))
-
-            (for ([w (in-set W)])
-              (when (is-var? w)
-                (define neighbors
-                  (match i
-                    [(Instr 'movq (list s d))
-                     (set-subtract live-after (locations-in-arg s))]
-                    [_ live-after]))
-
-                (for ([v (in-set neighbors)])
-                  (when (and (is-var? v)
-                             (not (equal? v w)))
-                    (add-edge! g w v))))))]))
-
-     ;; Store graph in info field
-     (X86Program (dict-set info 'conflicts g)
-                 blocks)]))
+     (build-interference-blocks blocks g)
+     (X86Program (dict-set info 'conflicts g) blocks)]))
 
 (define allocatable-registers
   '(rbx rcx rdx rsi rdi r8 r9 r10 r11))
@@ -916,20 +1180,34 @@
 (define (replace-arg a reg-env spill-env)
   (match a
     [(Reg x)
+
+ (if (is-var? x)
+
      (cond
+
        [(hash-has-key? reg-env x)
+
         (Reg (hash-ref reg-env x))]
+
        [(hash-has-key? spill-env x)
+
         (Deref 'rbp (hash-ref spill-env x))]
-       [else (Reg x)])]   ;; keep as register if already physical
+
+       [else (error "unallocated var (Reg)" x)])
+
+     (Reg x))]
 
     [(Var x)
-     (cond
-       [(hash-has-key? reg-env x)
-        (Reg (hash-ref reg-env x))]
-       [(hash-has-key? spill-env x)
-        (Deref 'rbp (hash-ref spill-env x))]
-       [else (error "unallocated var" x)])]
+ (cond
+   [(hash-has-key? reg-env x)
+    (Reg (hash-ref reg-env x))]
+
+   [(hash-has-key? spill-env x)
+    (Deref 'rbp (hash-ref spill-env x))]
+
+   ;; leave parameter vars untouched
+   [else
+    (Var x)])]
 
     [(Deref x offset)
      (cond
@@ -944,40 +1222,81 @@
 
 (define (replace-instr i reg-env spill-env)
   (match i
+    ;; normal instructions
     [(Instr op args)
      (Instr op
-            (map (λ (a)
+            (map (lambda (a)
                    (replace-arg a reg-env spill-env))
                  args))]
+
+    ;; 🔥 FIX: indirect call
+    [(IndirectCallq fun n)
+     (IndirectCallq
+      (replace-arg fun reg-env spill-env)
+      n)]
+
+    ;; 🔥 FIX: tail jump
+    [(TailJmp fun n)
+     (TailJmp
+      (replace-arg fun reg-env spill-env)
+      n)]
+
+    ;; keep others
+    [(Callq _ _) i]
+    [(Jmp _) i]
+    [(JmpIf _ _) i]
+
     [_ i]))
 
 
 
-(define (allocate_registers p)
-  (match p
-    [(X86Program info blocks)
-
-     (define g (dict-ref info 'conflicts))
-
-     (define-values (reg-env spills)
-       (color-graph g))
-
-     (define-values (spill-env _)
-       (assign-spills spills))
-
+(define (allocate-registers-def d)
+  (match d
+    [(Def f params rt def-info blocks)
+     (define g (dict-ref def-info 'conflicts))
+  
+     (define-values (reg-env spills) (color-graph g))
+     (define filtered-reg-env
+  (for/hash ([(k v) (in-dict reg-env)]
+             #:unless (member k (map car params)))
+    (values k v)))
+     (define-values (spill-env _) (assign-spills spills))
      (define new-blocks
        (for/hash ([(lbl block) (in-dict blocks)])
          (match block
            [(Block info2 instrs)
             (values lbl
                     (Block info2
-                           (map (λ (i)
-                                  (replace-instr i reg-env spill-env))
+                           (map (lambda (i) (replace-instr i filtered-reg-env spill-env))
                                 instrs)))])))
+     (Def f
+     params
+     rt
+     (dict-set
+      (dict-set
+       def-info
+       'reg-env reg-env)
+      'num-spills
+      (length spills))
+     new-blocks)]))
 
-     (X86Program
-      (dict-set info 'num-spills (length spills))
-      new-blocks)]))
+(define (allocate_registers p)
+  (match p
+    [(X86ProgramDefs info ds)
+     (X86ProgramDefs info (map allocate-registers-def ds))]
+    [(X86Program info blocks)
+     (define g (dict-ref info 'conflicts))
+     (define-values (reg-env spills) (color-graph g))
+     (define-values (spill-env _) (assign-spills spills))
+     (define new-blocks
+       (for/hash ([(lbl block) (in-dict blocks)])
+         (match block
+           [(Block info2 instrs)
+            (values lbl
+                    (Block info2
+                           (map (lambda (i) (replace-instr i reg-env spill-env))
+                                instrs)))])))
+     (X86Program (dict-set info 'num-spills (length spills)) new-blocks)]))
 
 
 
@@ -986,22 +1305,84 @@
 
 (define (select-tail t)
   (match t
-    [(Return e)
-     (append (select-exp e 'rax)
-             (list (Jmp 'conclusion)))]  ;; ← ADD THIS
 
+    ;; =========================
+    ;; RETURN CASE (FIXED)
+    ;; =========================
+    [(Return e)
+     (match e
+
+       ;; 🔥 HANDLE FUNCTION CALL
+       [(Call fun args)
+        (define arg-regs '(rdi rsi rdx rcx r8 r9))
+
+        (define arg-instrs
+          (apply append
+                 (for/list ([arg args] [reg arg-regs])
+                   (select-exp arg reg))))
+
+        (define call-instr
+  (match fun
+
+    ;; direct function call
+    [(Var f)
+     (Callq f (length args))]
+
+    ;; direct FunRef call
+    [(FunRef f _)
+     (Callq f (length args))]
+
+    ;; fallback
+    [_ 
+     (IndirectCallq fun (length args))])) ;; indirect
+
+        (append arg-instrs
+                (list call-instr)
+                (list (Jmp 'conclusion)))]
+
+       ;; normal return
+       [_
+        (append (select-exp e 'rax)
+                (list (Jmp 'conclusion)))])]
+
+    ;; =========================
+    ;; SEQUENCE
+    ;; =========================
     [(Seq s t2)
      (append (select-stmt s)
              (select-tail t2))]
 
+    ;; =========================
+    ;; IF
+    ;; =========================
     [(IfStmt c thn els)
      (match* (thn els)
        [((Goto l1) (Goto l2))
         (select-pred c l1 l2)])]
 
+    ;; =========================
+    ;; GOTO
+    ;; =========================
     [(Goto l)
-     (list (Jmp l))]))
+     (list (Jmp l))]
 
+    ;; =========================
+    ;; TAIL CALL
+    ;; =========================
+    [(TailCall fun args)
+     (define arg-regs '(rdi rsi rdx rcx r8 r9))
+
+     (define arg-instrs
+       (apply append
+              (for/list ([arg args] [reg arg-regs])
+                (select-exp arg reg))))
+
+     (define jump-instr
+       (match fun
+         [(FunRef f _) (TailJmp (Global f) (length args))]
+         [(Var x) (TailJmp (Var x) (length args))]))
+
+     (append arg-instrs (list jump-instr))]))
 
 (define (select-pred c thn els)
   (match c
@@ -1036,20 +1417,36 @@
               (Jmp els)))]))
 (define (select-stmt s)
   (match s
-    ;; vector-set! must come BEFORE general Assign case
+    ;; vector-set! first
     [(Assign (Var _) (Prim 'vector-set! (list (Var v) (Int i) val)))
      (match val
        [(Var src)
         (list
-         (Instr 'movq (list (Reg v) (Reg 'r11)))
+         (Instr 'movq (list (Var v) (Reg 'r11)))
          (Instr 'movq (list (Reg src) (Deref 'r11 (* 8 (+ i 1))))))]
        [_
         (append
          (select-exp val 'rax)
          (list
-          (Instr 'movq (list (Reg v) (Reg 'r11)))
+          (Instr 'movq (list (Var v) (Reg 'r11)))
           (Instr 'movq (list (Reg 'rax) (Deref 'r11 (* 8 (+ i 1)))))))])]
 
+    ;; ✅ MOVE THIS UP
+    [(Assign (Var x) (Call fun args))
+     (define arg-regs '(rdi rsi rdx rcx r8 r9))
+     (define arg-instrs
+       (apply append
+              (for/list ([arg args] [reg arg-regs])
+                (select-exp arg reg))))
+     (define call-instr
+  (match fun
+    [(FunRef f _) (Callq f (length args))]
+    [(Var f) (Callq f (length args))]))
+     (append arg-instrs
+             (list call-instr)
+             (list (Instr 'movq (list (Reg 'rax) (Var x)))))]
+    
+    ;; general assign LAST
     [(Assign (Var x) e)
      (select-exp e x)]
 
@@ -1083,16 +1480,36 @@
 (define (select-exp e dst)
   (match e
     [(Int n)
-     (list (Instr 'movq (list (Imm n) (Reg dst))))]
+ (cond
+   [(set-member? physical-registers dst)
+    (list (Instr 'movq (list (Imm n) (Reg dst))))]
+
+   [(symbol? dst)
+    (list (Instr 'movq (list (Imm n) (Var dst))))]
+
+   [else
+    (error "select-exp invalid dst" dst)])]
 
     [(Var x)
- (list (Instr 'movq (list (Reg x) (Reg dst))))]
+ (cond
+   [(set-member? physical-registers dst)
+    (list (Instr 'movq (list (Var x) (Reg dst))))]
+
+   [(symbol? dst)
+    (list (Instr 'movq (list (Var x) (Var dst))))]
+
+   [else
+    (error "select-exp invalid dst" dst)])]
 
     [(Bool #t)
-     (list (Instr 'movq (list (Imm 1) (Reg dst))))]
+ (if (set-member? physical-registers dst)
+     (list (Instr 'movq (list (Imm 1) (Reg dst))))
+     (list (Instr 'movq (list (Imm 1) (Var dst)))))]
 
-    [(Bool #f)
-     (list (Instr 'movq (list (Imm 0) (Reg dst))))]
+[(Bool #f)
+ (if (set-member? physical-registers dst)
+     (list (Instr 'movq (list (Imm 0) (Reg dst))))
+     (list (Instr 'movq (list (Imm 0) (Var dst)))))]
 
     ;; addition
     [(Prim '+ (list a b))
@@ -1126,6 +1543,9 @@
     [(Void)
      (list (Instr 'movq (list (Imm 0) (Reg dst))))]
 
+    [(FunRef f _)
+ (list (Instr 'leaq (list (Global f) (Reg dst))))]
+
     [(GlobalValue x)
      (list (Instr 'movq (list (Global x) (Reg dst))))]
 
@@ -1138,7 +1558,7 @@
 
     [(Prim 'vector-ref (list (Var v) (Int i)))
      (list
-      (Instr 'movq (list (Reg v) (Reg 'r11)))
+      (Instr 'movq (list (Var v) (Reg 'r11)))
       (Instr 'movq (list (Deref 'r11 (* 8 (+ i 1))) (Reg dst))))]
 
     [(Prim 'vector-set! (list (Var v) (Int i) val))
@@ -1155,49 +1575,78 @@
 
 
 ;; assign-homes : x86var -> x86var
-(define (assign-arg arg env)
-  (match arg
+(define (assign-arg a env)
+  (match a
     [(Var x)
-     (Deref 'rbp (dict-ref env x))]
-
-    [(Reg x)
-     (if (is-var? x)
+     (if (dict-has-key? env x)
          (Deref 'rbp (dict-ref env x))
-         (Reg x))]
+         (error "assign-homes: missing var" x))]
 
-    [else arg]))
+    [(Reg x) (Reg x)]
+
+    [(Deref r off)
+ (cond
+   [(dict-has-key? env r)
+    (Deref 'rbp (+ off (dict-ref env r)))]
+
+   [else
+    (Deref r off)])]
+    [_ a]))
 
 
-(define (assign-instr instr env)
-  (match instr
+(define (assign-instr i env)
+  (match i
+    ;; generic instruction
     [(Instr op args)
-     (Instr op (map (λ (a) (assign-arg a env)) args))]
-    [(Callq f n) instr]
-    [(Jmp l) instr]
-    [(JmpIf cc l) instr]
-    [else instr]))
+     (Instr op (map (lambda (a) (assign-arg a env)) args))]
+
+    ;; 🔥 IMPORTANT: handle indirect call
+    [(IndirectCallq fun n)
+     (IndirectCallq (assign-arg fun env) n)]
+
+    ;; 🔥 IMPORTANT: handle tail jump
+    [(TailJmp fun n)
+     (TailJmp (assign-arg fun env) n)]
+
+    ;; keep others
+    [(Callq _ _) i]
+    [(Jmp _) i]
+    [(JmpIf _ _) i]
+
+    [_ i]))
 
 (define (assign-block block env)
   (match block
     [(Block info instrs)
-     (Block info
-       (map (λ (i) (assign-instr i env)) instrs))]))
+
+     (define new-instrs
+       (map (λ (i) (assign-instr i env)) instrs))
+     (Block info new-instrs)]))
 
 
 (define (collect-vars-in-arg a)
   (match a
     [(Var x) (set x)]
-    [(Reg x)
-     (if (is-var? x)
-         (set x)
-         (set))]
-    [else (set)]))
+    [_ (set)]))
 
 (define (collect-vars-in-instr i)
   (match i
+
+    ;; normal instructions
     [(Instr _ args)
-     (apply set-union (map collect-vars-in-arg args))]
-    [else (set)]))
+     (apply set-union
+            (map collect-vars-in-arg args))]
+
+    ;; indirect calls
+    [(IndirectCallq fun _)
+     (collect-vars-in-arg fun)]
+
+    ;; tail jumps
+    [(TailJmp fun _)
+     (collect-vars-in-arg fun)]
+
+    ;; others
+    [_ (set)]))
 
 
 (define (collect-vars instrs)
@@ -1213,19 +1662,53 @@
 
 (define (assign-homes p)
   (match p
+
+    ;; NEW CASE (FOR FUNCTIONS)
+    [(X86ProgramDefs info ds)
+     (X86ProgramDefs info
+       (map assign-homes-def ds))]
+
+    ;; EXISTING CASE
     [(X86Program info blocks)
      (define all-instrs
        (apply append
               (for/list ([b (in-dict-values blocks)])
                 (match b [(Block _ is) is]))))
 
-     (define vars (collect-vars all-instrs))
+     ;; 🔥 FIXED
+     (define vars
+  (apply set-union
+         (map collect-vars-in-instr all-instrs)))
 
      (define-values (env _) (make-home-env vars))
 
      (X86Program info
        (for/hash ([(lbl block) (in-dict blocks)])
          (values lbl (assign-block block env))))]))
+
+
+(define (assign-homes-def d)
+  (match d
+    [(Def f params rt def-info blocks)
+
+     (define all-instrs
+       (apply append
+              (for/list ([b (in-dict-values blocks)])
+                (match b [(Block _ is) is]))))
+
+     ;; 🔥 FIXED
+     (define vars
+  (apply set-union
+         (map collect-vars-in-instr all-instrs)))
+
+     (define-values (env _) (make-home-env vars))
+
+     (Def f
+     params
+     rt
+     (dict-set def-info 'homes env)
+     (for/hash ([(lbl block) (in-dict blocks)])
+       (values lbl (assign-block block env))))]))
 
 
 
@@ -1258,6 +1741,10 @@
                (Instr 'cmpq (list patch-scratch d)))
          (list i))]
 
+    [(IndirectCallq _ _) (list i)]
+[(TailJmp _ _) (list i)]
+[(Instr 'leaq (list s d)) (list i)]
+
     [else (list i)]))
 
 
@@ -1277,6 +1764,15 @@
 
 (define (patch-instructions p)
   (match p
+    [(X86ProgramDefs info ds)
+     (X86ProgramDefs info
+       (map (lambda (d)
+              (match d
+                [(Def f params rt def-info blocks)
+                 (Def f params rt def-info
+                      (for/hash ([(lbl block) (in-dict blocks)])
+                        (values lbl (patch-block block))))]))
+            ds))]
     [(X86Program info blocks)
      (X86Program info
        (for/hash ([(lbl block) (in-dict blocks)])
@@ -1338,9 +1834,132 @@
 ;     ;; Do NOTHING except ensure retq is present
 ;     (X86Program info blocks)]))
 
+(define arg-registers '(rdi rsi rdx rcx r8 r9))
+
+(define (stack-size-aligned blocks)
+  (define raw (stack-size blocks))
+  (if (= (modulo raw 16) 0) raw (+ raw (- 16 (modulo raw 16)))))
+
+(define (rewrite-conclusion-jumps blocks conclusion-lbl)
+  (for/hash ([(lbl block) (in-dict blocks)])
+    (match block
+      [(Block info instrs)
+       (values lbl
+               (Block info
+                      (map (lambda (i)
+                             (match i
+                               [(Jmp 'conclusion) (Jmp conclusion-lbl)]
+                               [_ i]))
+                           instrs)))])))
+
+(define (prelude-conclusion-def d)
+  (match d
+    [(Def f params rt def-info blocks)
+
+     (define size (stack-size-aligned blocks))
+     (define start-lbl (symbol-append f '_start))
+     (define conclusion-lbl (symbol-append f '_conclusion))
+
+     ;; parameter home/register info
+     (define home
+       (dict-ref def-info 'homes (hash)))
+
+     (define reg-env
+       (dict-ref def-info 'reg-env (hash)))
+
+     ;; Move args into allocated homes/registers
+     (define param-moves
+  (for/list ([param params]
+             [reg arg-registers]
+             [i (in-naturals 1)])
+
+    (Instr 'movq
+           (list
+            (Reg reg)
+            (Deref 'rbp (* -8 i))))))
+
+     (define is-main? (eq? f 'main))
+
+     (define prelude-instrs
+       (append
+        (list
+         (Instr 'pushq (list (Reg 'rbp)))
+         (Instr 'movq (list (Reg 'rsp) (Reg 'rbp))))
+
+        (if (> size 0)
+            (list (Instr 'subq (list (Imm size) (Reg 'rsp))))
+            '())
+
+        (if is-main?
+            (list
+             (Instr 'movq (list (Global 'rootstack_begin) (Reg 'r15)))
+             (Instr 'movq (list (Imm 65536) (Reg 'rdi)))
+             (Instr 'movq (list (Imm 65536) (Reg 'rsi)))
+             (Callq 'initialize 2))
+            '())
+
+        param-moves
+
+        (list (Jmp start-lbl))))
+
+     (define conclusion-instrs
+       (append
+        (if (> size 0)
+            (list (Instr 'addq (list (Imm size) (Reg 'rsp))))
+            '())
+
+        (list
+         (Instr 'popq (list (Reg 'rbp)))
+         (Retq))))
+
+     (define blocks-with-prelude
+       (hash-set blocks f (Block '() prelude-instrs)))
+
+     (define rewritten-blocks
+       (rewrite-conclusion-jumps blocks-with-prelude conclusion-lbl))
+
+     (define new-blocks
+       (hash-set rewritten-blocks
+                 conclusion-lbl
+                 (Block '() conclusion-instrs)))
+     (Def f params rt def-info new-blocks)]))
+
 (define (prelude-and-conclusion p)
   (match p
+
+    ;; ================================
+    ;; X86ProgramDefs → FINAL PROGRAM
+    ;; ================================
+    [(X86ProgramDefs info ds)
+
+     ;; apply prelude/epilogue to each function
+     (define new-ds (map prelude-conclusion-def ds))
+
+     ;; flatten all blocks from all functions
+     (define all-blocks
+       (for/fold ([acc (hash)])
+                 ([d new-ds])
+         (match d
+           [(Def f params rt def-info blocks)
+            (for/fold ([acc2 acc])
+                      ([(lbl block) (in-dict blocks)])
+              (hash-set acc2 lbl block))])))
+
+     ;; ensure main entry exists
+     (unless (hash-has-key? all-blocks 'main)
+       (error "prelude-and-conclusion: missing 'main block"))
+
+     ;; return final x86 program
+     (X86Program
+      (cons (Global 'main) info)
+      all-blocks)]
+
+
+    ;; ================================
+    ;; OLD PATH (non-function programs)
+    ;; ================================
     [(X86Program info blocks)
+
      (define size (stack-size blocks))
 
      (define conclusion-block
@@ -1352,13 +1971,13 @@
            [(Block info2 instrs)
             (if (eq? lbl 'start)
                 (values 'main
-                  (Block info2
-                    (append (prologue size) instrs)))
+                        (Block info2
+                               (append (prologue size) instrs)))
                 (values lbl block))])))
 
      (X86Program
-       (cons (Global 'main) info)
-       (hash-set new-blocks 'conclusion conclusion-block))]))
+      (cons (Global 'main) info)
+      (hash-set new-blocks 'conclusion conclusion-block))]))
 
 (define (replace-ret-with-jmp instrs conclusion-lbl)
   (apply append
@@ -1385,15 +2004,17 @@
 ;; must be named "compiler.rkt"
 (define compiler-passes
   `(
-    ("shrink" ,shrink ,interp-Lvec ,type-check-Lvec)
-    ("uniquify" ,uniquify ,interp-Lvec ,type-check-Lvec)
-    ("expose_allocation" ,expose-allocation ,interp-Lvec #f)
-    ("remove_complex_opera*" ,remove-complex-opera* ,interp-Lvec #f)
-    ("explicate_control" ,explicate-control ,interp-Cvec #f)
-    ("select_instructions" ,select-instructions ,interp-pseudo-x86-1)
-    ("uncover_live" ,uncover_live ,interp-pseudo-x86-1)
-    ("build_interference" ,build_interference ,interp-pseudo-x86-1)
-    ("allocate_registers" ,allocate_registers ,interp-pseudo-x86-1)
-    ("patch_instructions" ,patch-instructions ,interp-x86-1)
-    ("prelude-and-conclusion" ,prelude-and-conclusion ,interp-x86-1)
+    ("shrink" ,shrink ,interp-Lfun ,type-check-Lfun)
+    ("uniquify" ,uniquify ,interp-Lfun ,type-check-Lfun)
+    ("reveal_functions" ,reveal-functions ,interp-Lfun #f)
+    ("expose_allocation" ,expose-allocation ,interp-Lfun #f)
+    ("remove_complex_opera*" ,remove-complex-opera* ,interp-Lfun #f)
+    ("explicate_control" ,explicate-control ,interp-Cfun #f)
+    ("select_instructions" ,select-instructions ,interp-pseudo-x86-2)
+    ("uncover_live" ,uncover_live ,interp-pseudo-x86-2)
+    ("build_interference" ,build_interference ,interp-pseudo-x86-2)
+    ("allocate_registers" ,allocate_registers ,interp-pseudo-x86-2)
+    ("assign_homes" ,assign-homes ,interp-x86-2)
+    ("patch_instructions" ,patch-instructions ,interp-x86-2)
+    ("prelude-and-conclusion" ,prelude-and-conclusion ,interp-x86-2)
   ))

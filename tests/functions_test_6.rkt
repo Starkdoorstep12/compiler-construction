@@ -1,0 +1,10 @@
+(define (f [x : Integer]) : Integer
+  (let ([a 1])
+    (let ([b 2])
+      (let ([c 3])
+        (let ([d 4])
+          (let ([e 5])
+            (let ([f 6])
+              (+ x (+ a (+ b (+ c (+ d (+ e f)))))))))))))
+
+(f 21)
