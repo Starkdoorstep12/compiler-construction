@@ -1741,7 +1741,19 @@
   (apply set-union
          (map collect-vars-in-instr all-instrs)))
 
-     (define-values (env _) (make-home-env vars))
+     ;; assign params first in order, then remaining vars
+(define param-names
+  (for/list ([p params]) (match p [`[,x : ,_] x] [(list x _) x] [x x])))
+(define param-env
+  (for/fold ([env (hash)] [offset -8] #:result env)
+            ([x param-names])
+    (values (hash-set env x offset) (- offset 8))))
+(define non-param-vars (set-subtract vars (list->set param-names)))
+(define-values (extra-env _)
+  (for/fold ([env param-env] [offset (* -8 (+ (length param-names) 1))])
+            ([v (in-set non-param-vars)])
+    (values (hash-set env v offset) (- offset 8))))
+(define env extra-env)
 
      (Def f
      params
