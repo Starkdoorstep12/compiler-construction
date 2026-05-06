@@ -605,12 +605,19 @@
     [(Prim op es)
      (Return (Prim op es))]
 
+; REMOVE this processed-args map, change to:
 [(Apply fun args)
- (define fun-atom
+ (define processed-args
+   (map (lambda (a)
+          (match a
+            [(FunRef f _) (Var f)]
+            [_ a]))
+        args))
+ (define fun^
    (match fun
      [(FunRef f _) (Var f)]
      [_ fun]))
- (Return (Call fun-atom args))]
+ (Return (Call fun^ processed-args))]  ; ← just pass args directly
 
     ;; -----------------------------
     ;; IF
@@ -752,17 +759,19 @@
        (explicate-assign x b k emit new-label)
        emit new-label)]
 
-    [(Apply fun args)
-
- (define fun-atom
+    ; REMOVE this processed-args map, change to:
+[(Apply fun args)
+ (define processed-args
+   (map (lambda (a)
+          (match a
+            [(FunRef f _) (Var f)]
+            [_ a]))
+        args))
+ (define fun^
    (match fun
      [(FunRef f _) (Var f)]
      [_ fun]))
-
- (Seq
-  (Assign (Var x)
-          (Call fun-atom args))
-  k)]))
+ (Seq (Assign (Var x) (Call fun^ processed-args)) k)]))
 
 (define (explicate-effect e emit new-label)
   (match e
@@ -798,16 +807,20 @@
       (explicate-effect body emit new-label)
       es)]
 
-    [(Apply fun args)
-
- (define fun-atom
+    ; REMOVE this processed-args map, change to:
+[(Apply fun args)
+ (define processed-args
+   (map (lambda (a)
+          (match a
+            [(FunRef f _) (Var f)]
+            [_ a]))
+        args))
+ (define fun^
    (match fun
      [(FunRef f _) (Var f)]
      [_ fun]))
-
  (Seq
-  (Assign (Var (gensym 'tmp))
-          (Call fun-atom args))
+  (Assign (Var (gensym 'tmp)) (Call fun^ processed-args))
   (Return (Void)))]
 
     [(Collect n)
@@ -852,20 +865,21 @@
 (define (select-instructions p)
   (match p
     [(ProgramDefs info ds)
+     (define known-funs (list->set (map Def-name ds)))  ; ← collect all names
      (define new-ds
        (map (lambda (d)
               (match d
                 [(Def f params rt def-info blocks)
                  (define new-blocks
                    (for/hash ([(lbl tail) (in-dict blocks)])
-                     (values lbl (Block '() (select-tail tail)))))
+                     (values lbl (Block '() (select-tail tail known-funs)))))
                  (Def f params rt def-info new-blocks)]))
             ds))
      (X86ProgramDefs info new-ds)]
     [(CProgram info blocks)
      (X86Program info
        (for/hash ([(lbl tail) (in-dict blocks)])
-         (values lbl (Block '() (select-tail tail)))))]))
+         (values lbl (Block '() (select-tail tail (set))))))]))
 
 
 ; we are doing 3.2 which is uncover_live
@@ -1303,7 +1317,7 @@
 
 ;;end
 
-(define (select-tail t)
+(define (select-tail t known-funs)
   (match t
 
     ;; =========================
@@ -1314,43 +1328,42 @@
 
        ;; 🔥 HANDLE FUNCTION CALL
        [(Call fun args)
-        (define arg-regs '(rdi rsi rdx rcx r8 r9))
+ (define arg-regs '(rdi rsi rdx rcx r8 r9))
 
-        (define arg-instrs
-          (apply append
-                 (for/list ([arg args] [reg arg-regs])
-                   (select-exp arg reg))))
+(define arg-instrs
+   (apply append
+          (for/list ([arg args] [reg arg-regs])
+            (select-exp arg reg known-funs))))
 
-        (define call-instr
-  (match fun
+ (define call-instr
+   (match fun
 
-    ;; direct function call
-    [(Var f)
-     (Callq f (length args))]
+     [(Var f)
+      (if (set-member? known-funs f)
+          (Callq f (length args))
+          (IndirectCallq (Var f) (length args)))]
 
-    ;; direct FunRef call
-    [(FunRef f _)
-     (Callq f (length args))]
+     [(FunRef f _)
+      (Callq f (length args))]
 
-    ;; fallback
-    [_ 
-     (IndirectCallq fun (length args))])) ;; indirect
+     [_ 
+      (IndirectCallq fun (length args))]))
 
-        (append arg-instrs
-                (list call-instr)
-                (list (Jmp 'conclusion)))]
+ (append arg-instrs
+         (list call-instr)
+         (list (Jmp 'conclusion)))]
 
        ;; normal return
        [_
-        (append (select-exp e 'rax)
+        (append (select-exp e 'rax known-funs)
                 (list (Jmp 'conclusion)))])]
 
     ;; =========================
     ;; SEQUENCE
     ;; =========================
     [(Seq s t2)
-     (append (select-stmt s)
-             (select-tail t2))]
+     (append (select-stmt s known-funs)
+             (select-tail t2 known-funs))]
 
     ;; =========================
     ;; IF
@@ -1375,7 +1388,7 @@
      (define arg-instrs
        (apply append
               (for/list ([arg args] [reg arg-regs])
-                (select-exp arg reg))))
+                (select-exp arg reg known-funs))))
 
      (define jump-instr
        (match fun
@@ -1415,7 +1428,7 @@
               (Instr 'cmpq (list (Imm 0) (Reg 'rax)))
               (JmpIf 'ne thn)
               (Jmp els)))]))
-(define (select-stmt s)
+(define (select-stmt s known-funs)
   (match s
     ;; vector-set! first
     [(Assign (Var _) (Prim 'vector-set! (list (Var v) (Int i) val)))
@@ -1426,7 +1439,7 @@
          (Instr 'movq (list (Reg src) (Deref 'r11 (* 8 (+ i 1))))))]
        [_
         (append
-         (select-exp val 'rax)
+         (select-exp val 'rax known-funs)
          (list
           (Instr 'movq (list (Var v) (Reg 'r11)))
           (Instr 'movq (list (Reg 'rax) (Deref 'r11 (* 8 (+ i 1)))))))])]
@@ -1437,18 +1450,22 @@
      (define arg-instrs
        (apply append
               (for/list ([arg args] [reg arg-regs])
-                (select-exp arg reg))))
-     (define call-instr
+                (select-exp arg reg known-funs))))
+(define call-instr
   (match fun
     [(FunRef f _) (Callq f (length args))]
-    [(Var f) (Callq f (length args))]))
+    [(Var f)
+     (if (set-member? known-funs f)
+         (Callq f (length args))
+         (IndirectCallq (Var f) (length args)))]))
      (append arg-instrs
              (list call-instr)
              (list (Instr 'movq (list (Reg 'rax) (Var x)))))]
     
     ;; general assign LAST
+    ;; general assign LAST
     [(Assign (Var x) e)
-     (select-exp e x)]
+     (select-exp e x known-funs)]
 
     [(Collect n)
      (list
@@ -1477,74 +1494,96 @@
    (arithmetic-shift len 1)
    1))
 
-(define (select-exp e dst)
+(define (select-exp e dst [known-funs (set)])
   (match e
+
     [(Int n)
- (cond
-   [(set-member? physical-registers dst)
-    (list (Instr 'movq (list (Imm n) (Reg dst))))]
+     (cond
+       [(set-member? physical-registers dst)
+        (list (Instr 'movq (list (Imm n) (Reg dst))))]
 
-   [(symbol? dst)
-    (list (Instr 'movq (list (Imm n) (Var dst))))]
+       [(symbol? dst)
+        (list (Instr 'movq (list (Imm n) (Var dst))))]
 
-   [else
-    (error "select-exp invalid dst" dst)])]
+       [else
+        (error "select-exp invalid dst" dst)])]
+
+    [(FunRef f _)
+     (cond
+       [(set-member? physical-registers dst)
+        (list
+         (Instr 'leaq
+                 (list (Global f) (Reg dst))))]
+
+       [(symbol? dst)
+        (list
+         (Instr 'leaq
+                 (list (Global f) (Reg 'rax)))
+         (Instr 'movq
+                 (list (Reg 'rax) (Var dst))))]
+
+       [else
+        (error "select-exp invalid FunRef dst" dst)])]
 
     [(Var x)
- (cond
-   [(set-member? physical-registers dst)
-    (list (Instr 'movq (list (Var x) (Reg dst))))]
+     (cond
+       [(set-member? known-funs x)
+        ;; x is a function name — load its address with leaq
+        (if (set-member? physical-registers dst)
+            (list (Instr 'leaq (list (Global x) (Reg dst))))
+            (list (Instr 'leaq (list (Global x) (Reg 'rax)))
+                  (Instr 'movq (list (Reg 'rax) (Var dst)))))]
 
-   [(symbol? dst)
-    (list (Instr 'movq (list (Var x) (Var dst))))]
+       [(set-member? physical-registers dst)
+        (list (Instr 'movq (list (Var x) (Reg dst))))]
 
-   [else
-    (error "select-exp invalid dst" dst)])]
+       [(symbol? dst)
+        (list (Instr 'movq (list (Var x) (Var dst))))]
+
+       [else
+        (error "select-exp invalid dst" dst)])]
 
     [(Bool #t)
- (if (set-member? physical-registers dst)
-     (list (Instr 'movq (list (Imm 1) (Reg dst))))
-     (list (Instr 'movq (list (Imm 1) (Var dst)))))]
+     (if (set-member? physical-registers dst)
+         (list (Instr 'movq (list (Imm 1) (Reg dst))))
+         (list (Instr 'movq (list (Imm 1) (Var dst)))))]
 
-[(Bool #f)
- (if (set-member? physical-registers dst)
-     (list (Instr 'movq (list (Imm 0) (Reg dst))))
-     (list (Instr 'movq (list (Imm 0) (Var dst)))))]
+    [(Bool #f)
+     (if (set-member? physical-registers dst)
+         (list (Instr 'movq (list (Imm 0) (Reg dst))))
+         (list (Instr 'movq (list (Imm 0) (Var dst)))))]
 
     ;; addition
     [(Prim '+ (list a b))
      (if (eq? dst 'rax)
-         ;; dst = rax → use scratch as temp register
-         (append (select-exp b scratch)
-                 (select-exp a 'rax)
-                 (list (Instr 'addq (list (Reg scratch) (Reg 'rax)))))
-         ;; dst ≠ rax → rax is the safe temp
-         (append (select-exp b 'rax)
-                 (select-exp a dst)
-                 (list (Instr 'addq (list (Reg 'rax) (Reg dst))))))]
+         (append
+          (select-exp b scratch)
+          (select-exp a 'rax)
+          (list (Instr 'addq (list (Reg scratch) (Reg 'rax)))))
+         (append
+          (select-exp b 'rax)
+          (select-exp a dst)
+          (list (Instr 'addq (list (Reg 'rax) (Reg dst))))))]
 
     ;; unary minus
     [(Prim '- (list a))
      (append (select-exp a dst)
              (list (Instr 'negq (list (Reg dst)))))]
-    
+
     ;; subtraction
     [(Prim '- (list a b))
      (if (eq? dst 'rax)
-         ;; dst = rax → use scratch thing as the temoirary register
-         (append (select-exp b scratch)
-                 (select-exp a 'rax)
-                 (list (Instr 'subq (list (Reg scratch) (Reg 'rax)))))
-         ;; dst ≠ rax
-         (append (select-exp b 'rax)
-                 (select-exp a dst)
-                 (list (Instr 'subq (list (Reg 'rax) (Reg dst))))))]
+         (append
+          (select-exp b scratch)
+          (select-exp a 'rax)
+          (list (Instr 'subq (list (Reg scratch) (Reg 'rax)))))
+         (append
+          (select-exp b 'rax)
+          (select-exp a dst)
+          (list (Instr 'subq (list (Reg 'rax) (Reg dst))))))]
 
     [(Void)
      (list (Instr 'movq (list (Imm 0) (Reg dst))))]
-
-    [(FunRef f _)
- (list (Instr 'leaq (list (Global f) (Reg dst))))]
 
     [(GlobalValue x)
      (list (Instr 'movq (list (Global x) (Reg dst))))]
@@ -1570,8 +1609,9 @@
 
     ;; read
     [(Prim 'read '())
-     (list (Callq 'read_int 0)
-           (Instr 'movq (list (Reg 'rax) (Reg dst))))]))
+     (list
+      (Callq 'read_int 0)
+      (Instr 'movq (list (Reg 'rax) (Reg dst))))]))
 
 
 ;; assign-homes : x86var -> x86var
@@ -1856,7 +1896,7 @@
   (match d
     [(Def f params rt def-info blocks)
 
-     (define size (stack-size-aligned blocks))
+     (define size (+ 8 (stack-size-aligned blocks)))
      (define start-lbl (symbol-append f '_start))
      (define conclusion-lbl (symbol-append f '_conclusion))
 
@@ -1884,6 +1924,7 @@
        (append
         (list
          (Instr 'pushq (list (Reg 'rbp)))
+         (Instr 'pushq (list (Reg 'rbx)))
          (Instr 'movq (list (Reg 'rsp) (Reg 'rbp))))
 
         (if (> size 0)
@@ -1909,6 +1950,7 @@
             '())
 
         (list
+         (Instr 'popq (list (Reg 'rbx)))
          (Instr 'popq (list (Reg 'rbp)))
          (Retq))))
 
