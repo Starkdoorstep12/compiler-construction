@@ -1668,6 +1668,16 @@
           (select-exp a dst)
           (list (Instr 'subq (list (Reg 'rax) (Reg dst))))))]
 
+    ;; multiplication
+[(Prim '* (list a b))
+ (append
+  (select-exp a 'rax)
+  (select-exp b 'r11)
+  (list (Instr 'imulq (list (Reg 'r11) (Reg 'rax))))
+  (if (set-member? physical-registers dst)
+      (list (Instr 'movq (list (Reg 'rax) (Reg dst))))
+      (list (Instr 'movq (list (Reg 'rax) (Var dst))))))]
+
     [(Void)
      (list (Instr 'movq (list (Imm 0) (Reg dst))))]
 
