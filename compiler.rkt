@@ -494,6 +494,9 @@
     [(Program info e)
      (Program info (rco-exp e))]))
 
+(define (mangle name)
+  (string->symbol (string-replace (symbol->string name) "-" "_")))
+
 
 ;; explicate-control : Lvar^mon -> Cvar
 (define (explicate-control p)
@@ -514,7 +517,7 @@
                  (define (emit label tail) (hash-set! blocks label tail))
 
                  ;; ✅ FIX: proper label
-                 (define start-label (symbol-append f '_start))
+                 (define start-label (symbol-append (mangle f) '_start))
                  (emit start-label (explicate-tail body emit new-label))
 
                  (Def f (for/list ([x xs] [p ps]) `[,x : ,p]) rt def-info blocks)]))
@@ -547,7 +550,7 @@
                  (define (emit label tail) (hash-set! blocks label tail))
 
                  ;; ✅ consistent label
-                 (define start-label (symbol-append f '_start))
+                 (define start-label (symbol-append (mangle f) '_start))
                  (emit start-label (explicate-tail body emit new-label))
 
                  (Def f (for/list ([x xs] [p ps]) `[,x : ,p]) rt def-info blocks)]))
@@ -1426,11 +1429,11 @@
 
      [(Var f)
       (if (set-member? known-funs f)
-          (Callq f (length args))
+          (Callq (mangle f) (length args))
           (IndirectCallq (Var f) (length args)))]
 
      [(FunRef f _)
-      (Callq f (length args))]
+      (Callq (mangle f) (length args))]
 
      [_ 
       (IndirectCallq fun (length args))]))
@@ -1539,10 +1542,10 @@
                 (select-exp arg reg known-funs))))
 (define call-instr
   (match fun
-    [(FunRef f _) (Callq f (length args))]
+    [(FunRef f _) (Callq (mangle f) (length args))]
     [(Var f)
      (if (set-member? known-funs f)
-         (Callq f (length args))
+         (Callq (mangle f) (length args))
          (IndirectCallq (Var f) (length args)))]))
      (append arg-instrs
              (list call-instr)
@@ -2005,8 +2008,9 @@
     [(Def f params rt def-info blocks)
 
      (define size (+ 8 (stack-size-aligned blocks)))
-     (define start-lbl (symbol-append f '_start))
-     (define conclusion-lbl (symbol-append f '_conclusion))
+     (define f^ (mangle f))
+(define start-lbl (symbol-append f^ '_start))
+(define conclusion-lbl (symbol-append f^ '_conclusion))
 
      ;; parameter home/register info
      (define home
@@ -2063,7 +2067,7 @@
          (Retq))))
 
      (define blocks-with-prelude
-       (hash-set blocks f (Block '() prelude-instrs)))
+  (hash-set blocks f^ (Block '() prelude-instrs)))
 
      (define rewritten-blocks
        (rewrite-conclusion-jumps blocks-with-prelude conclusion-lbl))
