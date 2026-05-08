@@ -1283,21 +1283,13 @@
 (define (replace-arg a reg-env spill-env)
   (match a
     [(Reg x)
-
  (if (is-var? x)
-
      (cond
-
        [(hash-has-key? reg-env x)
-
         (Reg (hash-ref reg-env x))]
-
        [(hash-has-key? spill-env x)
-
         (Deref 'rbp (hash-ref spill-env x))]
-
-       [else (error "unallocated var (Reg)" x)])
-
+       [else (Var x)])  ;; ← let assign-homes handle it
      (Reg x))]
 
     [(Var x)
@@ -1361,7 +1353,8 @@
      (define-values (reg-env spills) (color-graph g))
      (define filtered-reg-env
   (for/hash ([(k v) (in-dict reg-env)]
-             #:unless (member k (map car params)))
+             #:unless (member k (for/list ([p params])
+                     (match p [`[,x : ,_] x] [(list x _) x] [x x]))))
     (values k v)))
      (define-values (spill-env _) (assign-spills spills))
      (define new-blocks
