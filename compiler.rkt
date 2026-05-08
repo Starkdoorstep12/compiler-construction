@@ -1511,6 +1511,30 @@
               (JmpIf 'l thn)
               (Jmp els)))]
 
+    [(Prim '<= (list a b))
+ (append (select-exp a 'rax)
+         (select-exp b 'r11)
+         (list
+          (Instr 'cmpq (list (Reg 'r11) (Reg 'rax)))
+          (JmpIf 'le thn)
+          (Jmp els)))]
+
+[(Prim '> (list a b))
+ (append (select-exp a 'rax)
+         (select-exp b 'r11)
+         (list
+          (Instr 'cmpq (list (Reg 'r11) (Reg 'rax)))
+          (JmpIf 'g thn)
+          (Jmp els)))]
+
+[(Prim '>= (list a b))
+ (append (select-exp a 'rax)
+         (select-exp b 'r11)
+         (list
+          (Instr 'cmpq (list (Reg 'r11) (Reg 'rax)))
+          (JmpIf 'ge thn)
+          (Jmp els)))]
+
     [_  ;; fallback
      (append (select-exp c 'rax)
              (list
