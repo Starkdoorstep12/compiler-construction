@@ -7,18 +7,18 @@ assembly, through a sequence of well-defined compiler passes.
 
 ## Project Structure
 
-- `compiler.rkt` — the main compiler, defining the passes that translate
+- `compiler.rkt` - the main compiler, defining the passes that translate
   each source language down toward x86 assembly.
-- `interp-*.rkt` — interpreters for each intermediate language (`L*`) and
+- `interp-*.rkt` - interpreters for each intermediate language (`L*`) and
   C-like language (`C*`) used to verify passes at each stage.
-- `type-check-*.rkt` — type checkers for each language variant.
-- `runtime.c` / `runtime.h` — the runtime system linked with compiled
+- `type-check-*.rkt` - type checkers for each language variant.
+- `runtime.c` / `runtime.h` - the runtime system linked with compiled
   programs (garbage collection, I/O, etc.).
-- `utilities.rkt` — shared utilities, including `interp-tests` and
+- `utilities.rkt` - shared utilities, including `interp-tests` and
   `compiler-tests` used for testing passes and generated assembly.
-- `run-tests.rkt` — the test runner that exercises the compiler passes
+- `run-tests.rkt` - the test runner that exercises the compiler passes
   against the test suite.
-- `tests/` — test programs and expected results for each language stage.
+- `tests/` - test programs and expected results for each language stage.
 
 ## Setup
 
