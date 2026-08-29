@@ -25,7 +25,7 @@ assembly, through a sequence of well-defined compiler passes.
 ### 1. Clone the repository
 
 ```bash
-git clone <your-repo-url> compiler-construction
+git clone https://github.com/Starkdoorstep12/compiler-construction.git
 cd compiler-construction
 ```
 
